@@ -259,6 +259,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private autoRestartAttempts: number = 0;
   private lastConnectionState: string = 'close';
   private isAutoRestarting: boolean = false;
+  private wasOpenBeforeReconnect: boolean = false;
 
   public phoneNumber: string;
 
@@ -416,12 +417,17 @@ export class BaileysStartupService extends ChannelStartupService {
         clearTimeout(this.connectingTimer);
         this.connectingTimer = null;
       }
+
+      // Salva se l'istanza era 'open' prima del close (per auto-restart dopo riconnessione)
+      const wasOpenBeforeClose = this.lastConnectionState === 'open';
       this.lastConnectionState = 'close';
 
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
       if (shouldReconnect) {
+        // Se era 'open' e stiamo per riconnettere, potrebbe essere un cambio IP proxy
+        this.wasOpenBeforeReconnect = wasOpenBeforeClose;
         await this.connectToWhatsapp(this.phoneNumber);
       } else {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
@@ -465,6 +471,7 @@ export class BaileysStartupService extends ChannelStartupService {
         this.connectingTimer = null;
       }
       this.autoRestartAttempts = 0;
+      this.wasOpenBeforeReconnect = false;
       this.lastConnectionState = 'open';
 
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
@@ -521,13 +528,12 @@ export class BaileysStartupService extends ChannelStartupService {
       this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
 
       // Auto-restart logic quando l'istanza rimane in connecting (es. proxy IP change)
-      // Solo se lo stato precedente era 'open' e non stiamo già facendo auto-restart
-      const wasOpen = this.lastConnectionState === 'open';
+      // Usa flag wasOpenBeforeReconnect invece di lastConnectionState per evitare false negative
       this.lastConnectionState = 'connecting';
 
-      if (wasOpen && !this.isAutoRestarting && this.autoRestartAttempts < 3) {
+      if (this.wasOpenBeforeReconnect && !this.isAutoRestarting && this.autoRestartAttempts < 3) {
         this.logger.warn(
-          `Instance ${this.instance.name} stuck in 'connecting' state (was 'open'). Auto-restart will trigger in 15 seconds if still connecting...`,
+          `Instance ${this.instance.name} stuck in 'connecting' state (was 'open' before reconnect). Auto-restart will trigger in 15 seconds if still connecting...`,
         );
 
         // Cancella timer precedente se esiste
