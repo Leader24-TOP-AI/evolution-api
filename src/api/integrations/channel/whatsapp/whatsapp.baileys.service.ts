@@ -254,6 +254,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public stateConnection: wa.StateConnection = { state: 'close' };
 
+  // Auto-restart on proxy IP change
+  private connectingTimer: NodeJS.Timeout | null = null;
+  private autoRestartAttempts: number = 0;
+  private lastConnectionState: string = 'close';
+  private isAutoRestarting: boolean = false;
+
   public phoneNumber: string;
 
   public get connectionStatus() {
@@ -262,6 +268,13 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async logoutInstance() {
     this.messageProcessor.onDestroy();
+
+    // Cleanup auto-restart timer se attivo
+    if (this.connectingTimer) {
+      clearTimeout(this.connectingTimer);
+      this.connectingTimer = null;
+    }
+
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
     this.client?.ws?.close();
@@ -398,6 +411,13 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'close') {
+      // Cleanup auto-restart tracking quando la connessione si chiude
+      if (this.connectingTimer) {
+        clearTimeout(this.connectingTimer);
+        this.connectingTimer = null;
+      }
+      this.lastConnectionState = 'close';
+
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
@@ -439,6 +459,14 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      // Reset auto-restart tracking quando la connessione si apre con successo
+      if (this.connectingTimer) {
+        clearTimeout(this.connectingTimer);
+        this.connectingTimer = null;
+      }
+      this.autoRestartAttempts = 0;
+      this.lastConnectionState = 'open';
+
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -491,6 +519,63 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'connecting') {
       this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+
+      // Auto-restart logic quando l'istanza rimane in connecting (es. proxy IP change)
+      // Solo se lo stato precedente era 'open' e non stiamo già facendo auto-restart
+      const wasOpen = this.lastConnectionState === 'open';
+      this.lastConnectionState = 'connecting';
+
+      if (wasOpen && !this.isAutoRestarting && this.autoRestartAttempts < 3) {
+        this.logger.warn(
+          `Instance ${this.instance.name} stuck in 'connecting' state (was 'open'). Auto-restart will trigger in 15 seconds if still connecting...`,
+        );
+
+        // Cancella timer precedente se esiste
+        if (this.connectingTimer) {
+          clearTimeout(this.connectingTimer);
+        }
+
+        // Avvia timer di 15 secondi
+        this.connectingTimer = setTimeout(() => {
+          // Verifica che siamo ancora in stato 'connecting'
+          if (this.stateConnection.state === 'connecting') {
+            this.logger.warn(
+              `Instance ${this.instance.name} still in 'connecting' after 15 seconds. Triggering auto-restart (attempt ${this.autoRestartAttempts + 1}/3)...`,
+            );
+            this.autoRestart();
+          }
+        }, 15000); // 15 secondi
+      }
+    }
+  }
+
+  private async autoRestart() {
+    try {
+      this.isAutoRestarting = true;
+      this.autoRestartAttempts++;
+
+      // Pulisce cache Chatwoot se abilitato (safe anche se disabilitato)
+      this.clearCacheChatwoot();
+
+      this.logger.warn(
+        `Auto-restarting instance ${this.instance.name} (attempt ${this.autoRestartAttempts}/3) due to stuck 'connecting' state...`,
+      );
+
+      // Chiude la connessione corrente
+      this.client?.ws?.close();
+      this.client?.end(new Error('Auto-restart due to proxy IP change'));
+
+      // Attende un momento prima di riconnettersi
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+
+      // Riconnette all'istanza
+      await this.connectToWhatsapp(this.phoneNumber);
+
+      this.logger.info(`Auto-restart completed for instance ${this.instance.name}`);
+    } catch (error) {
+      this.logger.error(`Auto-restart failed for instance ${this.instance.name}: ${error.toString()}`);
+    } finally {
+      this.isAutoRestarting = false;
     }
   }
 
