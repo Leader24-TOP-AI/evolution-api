@@ -648,6 +648,26 @@ export class BaileysStartupService extends ChannelStartupService {
       this.client?.ws?.close();
       this.client?.end(new Error('Auto-restart'));
 
+      // ✅ FIX RACE CONDITION: Aspetta che lo stato diventi 'close' prima di chiamare controller
+      this.logger.info(
+        `[Auto-Restart] Instance ${this.instance.name} - Waiting for state to become 'close' (max 5 seconds)...`,
+      );
+
+      const stateChanged = await this.waitForState('close', 5000);
+
+      if (!stateChanged) {
+        this.logger.error(
+          `[Auto-Restart] Instance ${this.instance.name} - Timeout: state did not become 'close' within 5 seconds. Current state: ${this.stateConnection.state}. Aborting restart.`,
+        );
+        this.isAutoRestarting = false;
+        this.isAutoRestartTriggered = false;
+        return;
+      }
+
+      this.logger.info(
+        `[Auto-Restart] Instance ${this.instance.name} - State is now 'close'. Proceeding with controller reconnection...`,
+      );
+
       // ✅ USA IL CONTROLLER (come restart manuale della dashboard)
       // Import dinamico per evitare dipendenze circolari
       const { instanceController } = await import('@api/server.module');
@@ -674,6 +694,28 @@ export class BaileysStartupService extends ChannelStartupService {
     }
     // NOTA: isAutoRestarting NON viene resettato qui per evitare race conditions
     // Sarà resettato quando lo stato diventa 'open' (successo) o 'close' definitivo (fallimento)
+  }
+
+  private waitForState(expectedState: string, timeoutMs: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const startTime = Date.now();
+
+      const checkState = () => {
+        if (this.stateConnection.state === expectedState) {
+          resolve(true);
+          return;
+        }
+
+        if (Date.now() - startTime >= timeoutMs) {
+          resolve(false);
+          return;
+        }
+
+        setTimeout(checkState, 100); // Poll ogni 100ms
+      };
+
+      checkState();
+    });
   }
 
   private async getMessage(key: proto.IMessageKey, full = false) {
