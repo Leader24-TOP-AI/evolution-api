@@ -260,6 +260,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private lastConnectionState: string = 'close';
   private isAutoRestarting: boolean = false;
   private wasOpenBeforeReconnect: boolean = false;
+  private isAutoRestartTriggered: boolean = false;
 
   public phoneNumber: string;
 
@@ -419,17 +420,40 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       // Salva se l'istanza era 'open' prima del close (per auto-restart dopo riconnessione)
-      const wasOpenBeforeClose = this.lastConnectionState === 'open';
+      // Se isAutoRestartTriggered è true, preserva wasOpenBeforeReconnect (evita reset durante auto-restart)
+      const wasOpenBeforeClose = this.isAutoRestartTriggered
+        ? this.wasOpenBeforeReconnect
+        : this.lastConnectionState === 'open';
       this.lastConnectionState = 'close';
 
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+
       if (shouldReconnect) {
         // Se era 'open' e stiamo per riconnettere, potrebbe essere un cambio IP proxy
         this.wasOpenBeforeReconnect = wasOpenBeforeClose;
-        await this.connectToWhatsapp(this.phoneNumber);
+
+        // NON riconnettere se auto-restart è già in corso (evita doppia chiamata)
+        if (!this.isAutoRestarting) {
+          this.logger.info(
+            `[Connection] Instance ${this.instance.name} - Reconnecting after close (statusCode: ${statusCode})`,
+          );
+          await this.connectToWhatsapp(this.phoneNumber);
+        } else {
+          this.logger.info(
+            `[Connection] Instance ${this.instance.name} - Skipping auto-reconnect (auto-restart in progress)`,
+          );
+        }
       } else {
+        // Close definitivo (logout, forbidden, etc.) - Reset tutti i flag auto-restart
+        this.logger.warn(
+          `[Connection] Instance ${this.instance.name} - Definitive close (statusCode: ${statusCode}) - Resetting auto-restart flags`,
+        );
+        this.isAutoRestarting = false;
+        this.isAutoRestartTriggered = false;
+        this.wasOpenBeforeReconnect = false;
+        this.autoRestartAttempts = 0;
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
           status: 'closed',
@@ -470,8 +494,19 @@ export class BaileysStartupService extends ChannelStartupService {
         clearTimeout(this.connectingTimer);
         this.connectingTimer = null;
       }
+
+      // Log se auto-restart ha avuto successo
+      if (this.isAutoRestarting) {
+        this.logger.info(
+          `[Auto-Restart] Instance ${this.instance.name} - SUCCESS! Connection restored after ${this.autoRestartAttempts} attempt(s)`,
+        );
+      }
+
+      // Reset tutti i flag auto-restart
       this.autoRestartAttempts = 0;
       this.wasOpenBeforeReconnect = false;
+      this.isAutoRestarting = false;
+      this.isAutoRestartTriggered = false;
       this.lastConnectionState = 'open';
 
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
@@ -531,9 +566,14 @@ export class BaileysStartupService extends ChannelStartupService {
       // Usa flag wasOpenBeforeReconnect invece di lastConnectionState per evitare false negative
       this.lastConnectionState = 'connecting';
 
-      if (this.wasOpenBeforeReconnect && !this.isAutoRestarting && this.autoRestartAttempts < 3) {
+      // Log dettagliato per debug
+      this.logger.verbose(
+        `[Connection] Instance ${this.instance.name} - State: connecting | Flags: wasOpenBeforeReconnect=${this.wasOpenBeforeReconnect}, isAutoRestarting=${this.isAutoRestarting}, attempts=${this.autoRestartAttempts}/5`,
+      );
+
+      if (this.wasOpenBeforeReconnect && !this.isAutoRestarting && this.autoRestartAttempts < 5) {
         this.logger.warn(
-          `Instance ${this.instance.name} stuck in 'connecting' state (was 'open' before reconnect). Auto-restart will trigger in 15 seconds if still connecting...`,
+          `[Auto-Restart] Instance ${this.instance.name} - Detected stuck in 'connecting' state (was 'open' before reconnect). Auto-restart will trigger in 15 seconds if still connecting...`,
         );
 
         // Cancella timer precedente se esiste
@@ -546,11 +586,30 @@ export class BaileysStartupService extends ChannelStartupService {
           // Verifica che siamo ancora in stato 'connecting'
           if (this.stateConnection.state === 'connecting') {
             this.logger.warn(
-              `Instance ${this.instance.name} still in 'connecting' after 15 seconds. Triggering auto-restart (attempt ${this.autoRestartAttempts + 1}/3)...`,
+              `[Auto-Restart] Instance ${this.instance.name} - Still in 'connecting' after 15 seconds. Triggering auto-restart (attempt ${this.autoRestartAttempts + 1}/5)...`,
             );
             this.autoRestart();
+          } else {
+            this.logger.info(
+              `[Auto-Restart] Instance ${this.instance.name} - Timer expired but state changed to '${this.stateConnection.state}'. Auto-restart canceled.`,
+            );
           }
         }, 15000); // 15 secondi
+      } else {
+        // Log perché il timer NON è stato avviato
+        if (!this.wasOpenBeforeReconnect) {
+          this.logger.verbose(
+            `[Auto-Restart] Instance ${this.instance.name} - Timer NOT started: wasOpenBeforeReconnect is false`,
+          );
+        } else if (this.isAutoRestarting) {
+          this.logger.verbose(
+            `[Auto-Restart] Instance ${this.instance.name} - Timer NOT started: auto-restart already in progress`,
+          );
+        } else if (this.autoRestartAttempts >= 5) {
+          this.logger.error(
+            `[Auto-Restart] Instance ${this.instance.name} - Timer NOT started: max attempts reached (${this.autoRestartAttempts}/5). Instance stuck in 'connecting' state!`,
+          );
+        }
       }
     }
   }
@@ -558,31 +617,63 @@ export class BaileysStartupService extends ChannelStartupService {
   private async autoRestart() {
     try {
       this.isAutoRestarting = true;
+      this.isAutoRestartTriggered = true;
       this.autoRestartAttempts++;
 
-      // Pulisce cache Chatwoot se abilitato (safe anche se disabilitato)
-      this.clearCacheChatwoot();
+      const state = this.stateConnection.state;
 
       this.logger.warn(
-        `Auto-restarting instance ${this.instance.name} (attempt ${this.autoRestartAttempts}/3) due to stuck 'connecting' state...`,
+        `[Auto-Restart] Instance ${this.instance.name} - Attempt ${this.autoRestartAttempts}/5 - Current state: ${state} - Restarting via controller...`,
       );
 
-      // Chiude la connessione corrente
+      // Verifica stato (come fa il restart manuale del controller)
+      if (state === 'close') {
+        this.logger.error(
+          `[Auto-Restart] Instance ${this.instance.name} - Cannot restart: state is 'close' (definitively closed)`,
+        );
+        this.isAutoRestarting = false;
+        this.isAutoRestartTriggered = false;
+        return;
+      }
+
+      // Cleanup cache solo se era in stato 'open'
+      if (state === 'open' && this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
+        this.clearCacheChatwoot();
+      }
+
+      // Chiude la connessione corrente (come restart manuale)
+      this.logger.info(
+        `[Auto-Restart] Instance ${this.instance.name} - Closing current connection (ws + client.end)...`,
+      );
       this.client?.ws?.close();
-      this.client?.end(new Error('Auto-restart due to proxy IP change'));
+      this.client?.end(new Error('Auto-restart'));
 
-      // Attende un momento prima di riconnettersi
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      // ✅ USA IL CONTROLLER (come restart manuale della dashboard)
+      // Import dinamico per evitare dipendenze circolari
+      const { instanceController } = await import('@api/server.module');
 
-      // Riconnette all'istanza
-      await this.connectToWhatsapp(this.phoneNumber);
+      this.logger.info(
+        `[Auto-Restart] Instance ${this.instance.name} - Calling instanceController.connectToWhatsapp()...`,
+      );
 
-      this.logger.info(`Auto-restart completed for instance ${this.instance.name}`);
+      await instanceController.connectToWhatsapp({
+        instanceName: this.instance.name,
+        number: this.phoneNumber,
+      });
+
+      this.logger.info(
+        `[Auto-Restart] Instance ${this.instance.name} - Controller reconnection completed. Waiting for connection state update...`,
+      );
     } catch (error) {
-      this.logger.error(`Auto-restart failed for instance ${this.instance.name}: ${error.toString()}`);
-    } finally {
+      this.logger.error(
+        `[Auto-Restart] Instance ${this.instance.name} - Failed: ${error.toString()}`,
+      );
+      // Reset flag su errore
       this.isAutoRestarting = false;
+      this.isAutoRestartTriggered = false;
     }
+    // NOTA: isAutoRestarting NON viene resettato qui per evitare race conditions
+    // Sarà resettato quando lo stato diventa 'open' (successo) o 'close' definitivo (fallimento)
   }
 
   private async getMessage(key: proto.IMessageKey, full = false) {
