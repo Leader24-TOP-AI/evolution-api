@@ -9,6 +9,7 @@ export enum Events {
   QRCODE_UPDATED = 'qrcode.updated',
   CONNECTION_UPDATE = 'connection.update',
   STATUS_INSTANCE = 'status.instance',
+  INSTANCE_STUCK = 'instance.stuck', // ✅ FASE 4: Nuovo evento per istanze bloccate
   MESSAGES_SET = 'messages.set',
   MESSAGES_UPSERT = 'messages.upsert',
   MESSAGES_EDITED = 'messages.edited',

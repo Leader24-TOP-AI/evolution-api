@@ -82,7 +82,7 @@ import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
-import {makeProxyAgent, makeProxyAgentUndici} from '@utils/makeProxyAgent';
+import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
@@ -262,6 +262,16 @@ export class BaileysStartupService extends ChannelStartupService {
   private wasOpenBeforeReconnect: boolean = false;
   private isAutoRestartTriggered: boolean = false;
 
+  // ✅ FASE 2: Health Check System
+  private healthCheckTimer: NodeJS.Timeout | null = null;
+  private lastStateChangeTimestamp: number = Date.now();
+  private healthCheckInterval = 60000; // 60 secondi
+  private stuckInConnectingThreshold = 30000; // 30 secondi
+
+  // ✅ FASE 3: Auto-restart optimization
+  private readonly autoRestartTimerMs = 5000; // 5 secondi (ridotto da 15s per recovery più veloce)
+  private readonly maxAutoRestartAttempts = 10; // Aumentato da 5 a 10
+
   public phoneNumber: string;
 
   public get connectionStatus() {
@@ -276,6 +286,9 @@ export class BaileysStartupService extends ChannelStartupService {
       clearTimeout(this.connectingTimer);
       this.connectingTimer = null;
     }
+
+    // ✅ FASE 2: Cleanup health check timer
+    this.stopHealthCheck();
 
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
@@ -413,6 +426,10 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'close') {
+      // ✅ FASE 2: Update timestamp e ferma health check
+      this.lastStateChangeTimestamp = Date.now();
+      this.stopHealthCheck();
+
       // Cleanup auto-restart tracking quando la connessione si chiude
       if (this.connectingTimer) {
         clearTimeout(this.connectingTimer);
@@ -439,6 +456,26 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.info(
             `[Connection] Instance ${this.instance.name} - Reconnecting after close (statusCode: ${statusCode})`,
           );
+
+          // ✅ FASE 1 FIX: Ricarica proxy configuration dal DB PRIMA di riconnettere
+          // Questo assicura che se Oxylabs ha cambiato IP o sessione è scaduta, usiamo config fresca
+          this.logger.info(
+            `[Connection] Instance ${this.instance.name} - Reloading proxy configuration before reconnect...`,
+          );
+          await this.loadProxy();
+
+          // ✅ FASE 1 FIX: Chiudi completamente il client vecchio prima di riconnettere
+          // Il nuovo createClient() creerà un proxy agent completamente nuovo
+          if (this.client) {
+            this.logger.info(
+              `[Connection] Instance ${this.instance.name} - Closing old client completely before reconnect...`,
+            );
+            this.client?.ws?.close();
+            this.client?.end(new Error('Reconnect - closing old client for fresh start'));
+            // Piccolo delay per assicurare cleanup completo del socket e proxy agent
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+
           await this.connectToWhatsapp(this.phoneNumber);
         } else {
           this.logger.info(
@@ -509,6 +546,10 @@ export class BaileysStartupService extends ChannelStartupService {
       this.isAutoRestartTriggered = false;
       this.lastConnectionState = 'open';
 
+      // ✅ FASE 2: Update timestamp e avvia health check
+      this.lastStateChangeTimestamp = Date.now();
+      this.startHealthCheck();
+
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -566,14 +607,22 @@ export class BaileysStartupService extends ChannelStartupService {
       // Usa flag wasOpenBeforeReconnect invece di lastConnectionState per evitare false negative
       this.lastConnectionState = 'connecting';
 
+      // ✅ FASE 2: Update timestamp quando entra in connecting
+      this.lastStateChangeTimestamp = Date.now();
+
       // Log dettagliato per debug
       this.logger.verbose(
-        `[Connection] Instance ${this.instance.name} - State: connecting | Flags: wasOpenBeforeReconnect=${this.wasOpenBeforeReconnect}, isAutoRestarting=${this.isAutoRestarting}, attempts=${this.autoRestartAttempts}/5`,
+        `[Connection] Instance ${this.instance.name} - State: connecting | Flags: wasOpenBeforeReconnect=${this.wasOpenBeforeReconnect}, isAutoRestarting=${this.isAutoRestarting}, attempts=${this.autoRestartAttempts}/${this.maxAutoRestartAttempts}`,
       );
 
-      if (this.wasOpenBeforeReconnect && !this.isAutoRestarting && this.autoRestartAttempts < 5) {
+      // ✅ FASE 3: Timer ridotto a 5s e max attempts a 10
+      if (
+        this.wasOpenBeforeReconnect &&
+        !this.isAutoRestarting &&
+        this.autoRestartAttempts < this.maxAutoRestartAttempts
+      ) {
         this.logger.warn(
-          `[Auto-Restart] Instance ${this.instance.name} - Detected stuck in 'connecting' state (was 'open' before reconnect). Auto-restart will trigger in 15 seconds if still connecting...`,
+          `[Auto-Restart] Instance ${this.instance.name} - Detected stuck in 'connecting' state (was 'open' before reconnect). Auto-restart will trigger in ${this.autoRestartTimerMs / 1000}s if still connecting...`,
         );
 
         // Cancella timer precedente se esiste
@@ -581,12 +630,12 @@ export class BaileysStartupService extends ChannelStartupService {
           clearTimeout(this.connectingTimer);
         }
 
-        // Avvia timer di 15 secondi
+        // Avvia timer (ottimizzato: 5 secondi invece di 15)
         this.connectingTimer = setTimeout(() => {
           // Verifica che siamo ancora in stato 'connecting'
           if (this.stateConnection.state === 'connecting') {
             this.logger.warn(
-              `[Auto-Restart] Instance ${this.instance.name} - Still in 'connecting' after 15 seconds. Triggering auto-restart (attempt ${this.autoRestartAttempts + 1}/5)...`,
+              `[Auto-Restart] Instance ${this.instance.name} - Still in 'connecting' after ${this.autoRestartTimerMs / 1000}s. Triggering auto-restart (attempt ${this.autoRestartAttempts + 1}/${this.maxAutoRestartAttempts})...`,
             );
             this.autoRestart();
           } else {
@@ -594,7 +643,7 @@ export class BaileysStartupService extends ChannelStartupService {
               `[Auto-Restart] Instance ${this.instance.name} - Timer expired but state changed to '${this.stateConnection.state}'. Auto-restart canceled.`,
             );
           }
-        }, 15000); // 15 secondi
+        }, this.autoRestartTimerMs);
       } else {
         // Log perché il timer NON è stato avviato
         if (!this.wasOpenBeforeReconnect) {
@@ -605,9 +654,9 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(
             `[Auto-Restart] Instance ${this.instance.name} - Timer NOT started: auto-restart already in progress`,
           );
-        } else if (this.autoRestartAttempts >= 5) {
+        } else if (this.autoRestartAttempts >= this.maxAutoRestartAttempts) {
           this.logger.error(
-            `[Auto-Restart] Instance ${this.instance.name} - Timer NOT started: max attempts reached (${this.autoRestartAttempts}/5). Instance stuck in 'connecting' state!`,
+            `[Auto-Restart] Instance ${this.instance.name} - Timer NOT started: max attempts reached (${this.autoRestartAttempts}/${this.maxAutoRestartAttempts}). Instance stuck in 'connecting' state!`,
           );
         }
       }
@@ -623,7 +672,7 @@ export class BaileysStartupService extends ChannelStartupService {
       const state = this.stateConnection.state;
 
       this.logger.warn(
-        `[Auto-Restart] Instance ${this.instance.name} - Attempt ${this.autoRestartAttempts}/5 - Current state: ${state} - Restarting via controller...`,
+        `[Auto-Restart] Instance ${this.instance.name} - Attempt ${this.autoRestartAttempts}/${this.maxAutoRestartAttempts} - Current state: ${state} - Restarting via controller...`,
       );
 
       // Verifica stato (come fa il restart manuale del controller)
@@ -685,9 +734,7 @@ export class BaileysStartupService extends ChannelStartupService {
         `[Auto-Restart] Instance ${this.instance.name} - Controller reconnection completed. Waiting for connection state update...`,
       );
     } catch (error) {
-      this.logger.error(
-        `[Auto-Restart] Instance ${this.instance.name} - Failed: ${error.toString()}`,
-      );
+      this.logger.error(`[Auto-Restart] Instance ${this.instance.name} - Failed: ${error.toString()}`);
       // Reset flag su errore
       this.isAutoRestarting = false;
       this.isAutoRestartTriggered = false;
@@ -716,6 +763,190 @@ export class BaileysStartupService extends ChannelStartupService {
 
       checkState();
     });
+  }
+
+  // ✅ FASE 2: Health Check System Functions
+
+  /**
+   * Avvia il health check periodico per monitorare lo stato dell'istanza
+   * e rilevare problemi come blocchi in 'connecting' o proxy failures
+   */
+  private startHealthCheck() {
+    // Ferma il timer precedente se esiste
+    this.stopHealthCheck();
+
+    this.logger.info(
+      `[HealthCheck] Instance ${this.instance.name} - Starting health check (interval: ${this.healthCheckInterval}ms)`,
+    );
+
+    this.healthCheckTimer = setInterval(async () => {
+      try {
+        await this.performHealthCheck();
+      } catch (error) {
+        this.logger.error(
+          `[HealthCheck] Instance ${this.instance.name} - Error during health check: ${error.toString()}`,
+        );
+      }
+    }, this.healthCheckInterval);
+  }
+
+  /**
+   * Ferma il health check periodico
+   */
+  private stopHealthCheck() {
+    if (this.healthCheckTimer) {
+      this.logger.info(`[HealthCheck] Instance ${this.instance.name} - Stopping health check`);
+      clearInterval(this.healthCheckTimer);
+      this.healthCheckTimer = null;
+    }
+  }
+
+  /**
+   * Esegue un controllo di salute dell'istanza
+   */
+  private async performHealthCheck() {
+    const state = this.stateConnection.state;
+    const now = Date.now();
+    const stateAge = now - this.lastStateChangeTimestamp;
+
+    this.logger.verbose(
+      `[HealthCheck] Instance ${this.instance.name} - State: ${state}, Age: ${Math.round(stateAge / 1000)}s`,
+    );
+
+    // 1. Rileva istanze bloccate in 'connecting' per più di 30 secondi
+    if (state === 'connecting' && stateAge > this.stuckInConnectingThreshold) {
+      this.logger.warn(
+        `[HealthCheck] Instance ${this.instance.name} - STUCK in 'connecting' for ${Math.round(stateAge / 1000)}s (threshold: ${this.stuckInConnectingThreshold / 1000}s)`,
+      );
+
+      // ✅ FASE 4: Invia webhook event INSTANCE_STUCK
+      this.sendDataWebhook(Events.INSTANCE_STUCK, {
+        instance: this.instance.name,
+        state: state,
+        stuckDuration: Math.round(stateAge / 1000),
+        threshold: this.stuckInConnectingThreshold / 1000,
+        lastStateChange: new Date(this.lastStateChangeTimestamp).toISOString(),
+        action: 'force_restart',
+        reason: 'stuck_in_connecting',
+      });
+
+      // Trigger force restart se non è già in corso un auto-restart
+      if (!this.isAutoRestarting) {
+        this.logger.warn(`[HealthCheck] Instance ${this.instance.name} - Triggering force restart...`);
+        await this.forceRestart('Health check detected stuck in connecting state');
+      } else {
+        this.logger.info(
+          `[HealthCheck] Instance ${this.instance.name} - Auto-restart already in progress, skipping force restart`,
+        );
+      }
+      return;
+    }
+
+    // 2. Test connessione proxy se abilitato e istanza è 'open'
+    if (state === 'open' && this.localProxy?.enabled) {
+      const proxyOk = await this.testProxyConnection();
+      if (!proxyOk) {
+        this.logger.warn(
+          `[HealthCheck] Instance ${this.instance.name} - Proxy connection test FAILED. Triggering preventive restart...`,
+        );
+
+        // ✅ FASE 4: Invia webhook event INSTANCE_STUCK per proxy failure
+        this.sendDataWebhook(Events.INSTANCE_STUCK, {
+          instance: this.instance.name,
+          state: state,
+          action: 'preventive_restart',
+          reason: 'proxy_connection_failure',
+          proxyHost: this.localProxy.host,
+          proxyPort: this.localProxy.port,
+        });
+
+        await this.forceRestart('Health check detected proxy connection failure');
+      } else {
+        this.logger.verbose(`[HealthCheck] Instance ${this.instance.name} - Proxy connection test OK`);
+      }
+    }
+  }
+
+  /**
+   * Testa la connessione proxy con una richiesta HTTP semplice
+   */
+  private async testProxyConnection(): Promise<boolean> {
+    if (!this.localProxy?.enabled) {
+      return true; // Nessun proxy configurato
+    }
+
+    try {
+      this.logger.verbose(
+        `[HealthCheck] Instance ${this.instance.name} - Testing proxy connection to ${this.localProxy.host}...`,
+      );
+
+      // Creo la stringa di proxy URL
+      let proxyUrl: string;
+      if (this.localProxy.username && this.localProxy.password) {
+        proxyUrl = `${this.localProxy.protocol}://${this.localProxy.username}:${this.localProxy.password}@${this.localProxy.host}:${this.localProxy.port}`;
+      } else {
+        proxyUrl = `${this.localProxy.protocol}://${this.localProxy.host}:${this.localProxy.port}`;
+      }
+
+      // Test semplice: richiesta a un endpoint che restituisce l'IP pubblico
+      const response = await axios.get('https://api.ipify.org?format=json', {
+        proxy: false, // Disabilita proxy automatico axios
+        httpsAgent: makeProxyAgent(proxyUrl),
+        timeout: 10000, // 10 secondi timeout
+      });
+
+      if (response.status === 200 && response.data?.ip) {
+        this.logger.verbose(
+          `[HealthCheck] Instance ${this.instance.name} - Proxy test successful (IP: ${response.data.ip})`,
+        );
+        return true;
+      }
+
+      this.logger.warn(`[HealthCheck] Instance ${this.instance.name} - Proxy test returned unexpected response`);
+      return false;
+    } catch (error) {
+      this.logger.warn(`[HealthCheck] Instance ${this.instance.name} - Proxy test failed: ${error.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Force restart dell'istanza quando rilevato un problema
+   */
+  private async forceRestart(reason: string) {
+    try {
+      this.logger.warn(`[ForceRestart] Instance ${this.instance.name} - Forcing restart. Reason: ${reason}`);
+
+      // Marca come auto-restarting per evitare conflitti
+      this.isAutoRestarting = true;
+
+      // Chiudi completamente il client
+      if (this.client) {
+        this.logger.info(`[ForceRestart] Instance ${this.instance.name} - Closing client...`);
+        this.client?.ws?.close();
+        this.client?.end(new Error(`Force restart: ${reason}`));
+
+        // Aspetta che diventi 'close'
+        const closed = await this.waitForState('close', 5000);
+        if (!closed) {
+          this.logger.error(
+            `[ForceRestart] Instance ${this.instance.name} - Timeout waiting for 'close' state. Current state: ${this.stateConnection.state}`,
+          );
+          this.isAutoRestarting = false;
+          return;
+        }
+      }
+
+      // Ricarica proxy e riconnetti
+      this.logger.info(`[ForceRestart] Instance ${this.instance.name} - Reloading proxy and reconnecting...`);
+      await this.loadProxy();
+      await this.connectToWhatsapp(this.phoneNumber);
+
+      this.logger.info(`[ForceRestart] Instance ${this.instance.name} - Restart completed`);
+    } catch (error) {
+      this.logger.error(`[ForceRestart] Instance ${this.instance.name} - Failed: ${error.toString()}`);
+      this.isAutoRestarting = false;
+    }
   }
 
   private async getMessage(key: proto.IMessageKey, full = false) {
