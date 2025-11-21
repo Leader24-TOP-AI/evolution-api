@@ -813,13 +813,28 @@ export class BaileysStartupService extends ChannelStartupService {
       `[HealthCheck] Instance ${this.instance.name} - State: ${state}, Age: ${Math.round(stateAge / 1000)}s`,
     );
 
-    // 1. Rileva istanze bloccate in 'connecting' per più di 30 secondi
+    // 1. Rileva istanze bloccate in 'connecting' per più di 30 secondi - MA solo se già connesse prima
     if (state === 'connecting' && stateAge > this.stuckInConnectingThreshold) {
+      // ✅ NUOVA LOGICA: Verifica se è prima connessione (aspetta QR code)
+      const dbInstance = await this.prismaRepository.instance.findUnique({
+        where: { id: this.instanceId },
+        select: { ownerJid: true },
+      });
+
+      // Se ownerJid è NULL, è una nuova istanza che aspetta il QR code → NON restartare
+      if (dbInstance?.ownerJid === null || dbInstance?.ownerJid === undefined) {
+        this.logger.info(
+          `[HealthCheck] Instance ${this.instance.name} - First connection detected (no ownerJid). In 'connecting' state for ${Math.round(stateAge / 1000)}s waiting for QR code scan. Skipping force restart.`,
+        );
+        return; // ← Non fare restart!
+      }
+
+      // Se ownerJid esiste, l'istanza era già connessa → PROBLEMA reale!
       this.logger.warn(
-        `[HealthCheck] Instance ${this.instance.name} - STUCK in 'connecting' for ${Math.round(stateAge / 1000)}s (threshold: ${this.stuckInConnectingThreshold / 1000}s)`,
+        `[HealthCheck] Instance ${this.instance.name} - STUCK in 'connecting' for ${Math.round(stateAge / 1000)}s (was previously connected with ownerJid: ${dbInstance.ownerJid})`,
       );
 
-      // ✅ FASE 4: Invia webhook event INSTANCE_STUCK
+      // ✅ Invia webhook event INSTANCE_STUCK con ownerJid info
       this.sendDataWebhook(Events.INSTANCE_STUCK, {
         instance: this.instance.name,
         state: state,
@@ -827,13 +842,14 @@ export class BaileysStartupService extends ChannelStartupService {
         threshold: this.stuckInConnectingThreshold / 1000,
         lastStateChange: new Date(this.lastStateChangeTimestamp).toISOString(),
         action: 'force_restart',
-        reason: 'stuck_in_connecting',
+        reason: 'stuck_in_reconnecting',
+        ownerJid: dbInstance.ownerJid,
       });
 
       // Trigger force restart se non è già in corso un auto-restart
       if (!this.isAutoRestarting) {
         this.logger.warn(`[HealthCheck] Instance ${this.instance.name} - Triggering force restart...`);
-        await this.forceRestart('Health check detected stuck in connecting state');
+        await this.forceRestart('Health check detected stuck in reconnecting state');
       } else {
         this.logger.info(
           `[HealthCheck] Instance ${this.instance.name} - Auto-restart already in progress, skipping force restart`,
