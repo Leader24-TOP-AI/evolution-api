@@ -272,6 +272,23 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly autoRestartTimerMs = 5000; // 5 secondi (ridotto da 15s per recovery più veloce)
   private readonly maxAutoRestartAttempts = 10; // Aumentato da 5 a 10
 
+  // ✅ FIX #1: Safety timeout management (prevent memory leak)
+  private safetyTimeout: NodeJS.Timeout | null = null;
+
+  // ✅ FIX #2: Force restart attempts tracking
+  private forceRestartAttempts = 0;
+  private readonly MAX_FORCE_RESTART_ATTEMPTS = 5;
+  private lastForceRestartTime = 0;
+  private readonly MIN_FORCE_RESTART_INTERVAL = 5000; // 5s minimo tra force restart
+
+  // ✅ FIX #8: Cache per ottimizzazioni
+  private cachedOwnerJid: string | null = null;
+  private proxyTestCache: Map<string, { result: boolean; timestamp: number }> = new Map();
+  private readonly PROXY_TEST_CACHE_TTL = 120000; // 2 minuti
+
+  // ✅ FIX #11: Log state tracking
+  private lastLoggedHealthState: { state: string; age: number } | null = null;
+
   public phoneNumber: string;
 
   public get connectionStatus() {
@@ -290,9 +307,26 @@ export class BaileysStartupService extends ChannelStartupService {
     // ✅ FASE 2: Cleanup health check timer
     this.stopHealthCheck();
 
+    // ✅ FIX #1: Cleanup safety timeout
+    if (this.safetyTimeout) {
+      clearTimeout(this.safetyTimeout);
+      this.safetyTimeout = null;
+    }
+
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
     this.client?.ws?.close();
+
+    // ✅ FIX #6: Reset ownerJid al logout per permettere riuso nome istanza
+    await this.prismaRepository.instance.update({
+      where: { id: this.instanceId },
+      data: {
+        ownerJid: null,
+        profileName: null,
+        profilePicUrl: null,
+        connectionStatus: 'close',
+      },
+    });
 
     const sessionExists = await this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } });
     if (sessionExists) {
@@ -539,6 +573,12 @@ export class BaileysStartupService extends ChannelStartupService {
         );
       }
 
+      // ✅ FIX #1: Cancella safety timeout se connection raggiunge 'open'
+      if (this.safetyTimeout) {
+        clearTimeout(this.safetyTimeout);
+        this.safetyTimeout = null;
+      }
+
       // Reset tutti i flag auto-restart
       this.autoRestartAttempts = 0;
       this.wasOpenBeforeReconnect = false;
@@ -546,9 +586,16 @@ export class BaileysStartupService extends ChannelStartupService {
       this.isAutoRestartTriggered = false;
       this.lastConnectionState = 'open';
 
+      // ✅ FIX #2: Reset force restart attempts su SUCCESS
+      this.forceRestartAttempts = 0;
+      this.lastForceRestartTime = 0;
+
       // ✅ FASE 2: Update timestamp e avvia health check
       this.lastStateChangeTimestamp = Date.now();
       this.startHealthCheck();
+
+      // ✅ FIX #8: Cache ownerJid per evitare query DB ripetute
+      this.cachedOwnerJid = this.client.user.id.replace(/:\d+/, '');
 
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
@@ -602,6 +649,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'connecting') {
       this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+
+      // ✅ FIX #5: Ferma health check durante connecting (verrà riavviato in 'open')
+      // Evita spreco risorse e possibili conflitti con auto-restart
+      this.stopHealthCheck();
 
       // Auto-restart logic quando l'istanza rimane in connecting (es. proxy IP change)
       // Usa flag wasOpenBeforeReconnect invece di lastConnectionState per evitare false negative
@@ -775,8 +826,13 @@ export class BaileysStartupService extends ChannelStartupService {
     // Ferma il timer precedente se esiste
     this.stopHealthCheck();
 
+    // ✅ FIX #4: Jitter random ±10s per evitare thundering herd
+    // Distribuisce health check su finestra 50-70s invece di spike a 60s
+    const jitter = Math.random() * 20000 - 10000; // -10s a +10s
+    const interval = this.healthCheckInterval + jitter;
+
     this.logger.info(
-      `[HealthCheck] Instance ${this.instance.name} - Starting health check (interval: ${this.healthCheckInterval}ms)`,
+      `[HealthCheck] Instance ${this.instance.name} - Starting health check (interval: ${Math.round(interval / 1000)}s with jitter)`,
     );
 
     this.healthCheckTimer = setInterval(async () => {
@@ -787,7 +843,7 @@ export class BaileysStartupService extends ChannelStartupService {
           `[HealthCheck] Instance ${this.instance.name} - Error during health check: ${error.toString()}`,
         );
       }
-    }, this.healthCheckInterval);
+    }, interval); // ✅ Usa interval con jitter
   }
 
   /**
@@ -809,9 +865,18 @@ export class BaileysStartupService extends ChannelStartupService {
     const now = Date.now();
     const stateAge = now - this.lastStateChangeTimestamp;
 
-    this.logger.verbose(
-      `[HealthCheck] Instance ${this.instance.name} - State: ${state}, Age: ${Math.round(stateAge / 1000)}s`,
-    );
+    // ✅ FIX #11: Log condizionale - solo se stato cambia o milestone (ogni minuto)
+    const shouldLog =
+      !this.lastLoggedHealthState ||
+      this.lastLoggedHealthState.state !== state ||
+      (stateAge > 60000 && Math.floor(stateAge / 60000) !== Math.floor(this.lastLoggedHealthState.age / 60000));
+
+    if (shouldLog) {
+      this.logger.verbose(
+        `[HealthCheck] Instance ${this.instance.name} - State: ${state}, Age: ${Math.round(stateAge / 1000)}s`,
+      );
+      this.lastLoggedHealthState = { state, age: stateAge };
+    }
 
     // 0. Rileva flag isAutoRestarting bloccato (backup safety net se timeout in forceRestart fallisce)
     if (this.isAutoRestarting && state !== 'open' && stateAge > 60000) {
@@ -843,14 +908,28 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // 1. Rileva istanze bloccate in 'connecting' per più di 30 secondi - MA solo se già connesse prima
     if (state === 'connecting' && stateAge > this.stuckInConnectingThreshold) {
-      // ✅ NUOVA LOGICA: Verifica se è prima connessione (aspetta QR code)
-      const dbInstance = await this.prismaRepository.instance.findUnique({
-        where: { id: this.instanceId },
-        select: { ownerJid: true },
-      });
+      // ✅ FIX #8: Usa cache ownerJid se disponibile (evita query DB ripetute)
+      let ownerJid = this.cachedOwnerJid;
+
+      // ✅ FIX #3: Se cache vuota, query DB con try-catch (fallback se DB down)
+      if (ownerJid === null && this.cachedOwnerJid === null) {
+        try {
+          const dbInstance = await this.prismaRepository.instance.findUnique({
+            where: { id: this.instanceId },
+            select: { ownerJid: true },
+          });
+          ownerJid = dbInstance?.ownerJid || null;
+          this.cachedOwnerJid = ownerJid; // ✅ Aggiorna cache
+        } catch (dbError) {
+          this.logger.error(
+            `[HealthCheck] Instance ${this.instance.name} - DB query failed: ${dbError.message}. Skipping force restart (safe fallback).`,
+          );
+          return; // ✅ Safe fallback: se DB down, NON force restart
+        }
+      }
 
       // Se ownerJid è NULL, è una nuova istanza che aspetta il QR code → NON restartare
-      if (dbInstance?.ownerJid === null || dbInstance?.ownerJid === undefined) {
+      if (ownerJid === null || ownerJid === undefined) {
         this.logger.info(
           `[HealthCheck] Instance ${this.instance.name} - First connection detected (no ownerJid). In 'connecting' state for ${Math.round(stateAge / 1000)}s waiting for QR code scan. Skipping force restart.`,
         );
@@ -859,7 +938,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       // Se ownerJid esiste, l'istanza era già connessa → PROBLEMA reale!
       this.logger.warn(
-        `[HealthCheck] Instance ${this.instance.name} - STUCK in 'connecting' for ${Math.round(stateAge / 1000)}s (was previously connected with ownerJid: ${dbInstance.ownerJid})`,
+        `[HealthCheck] Instance ${this.instance.name} - STUCK in 'connecting' for ${Math.round(stateAge / 1000)}s (was previously connected with ownerJid: ${ownerJid})`,
       );
 
       // ✅ Invia webhook event INSTANCE_STUCK con ownerJid info
@@ -871,7 +950,7 @@ export class BaileysStartupService extends ChannelStartupService {
         lastStateChange: new Date(this.lastStateChangeTimestamp).toISOString(),
         action: 'force_restart',
         reason: 'stuck_in_reconnecting',
-        ownerJid: dbInstance.ownerJid,
+        ownerJid: ownerJid,
       });
 
       // Trigger force restart se non è già in corso un auto-restart
@@ -913,10 +992,22 @@ export class BaileysStartupService extends ChannelStartupService {
 
   /**
    * Testa la connessione proxy con una richiesta HTTP semplice
+   * ✅ FIX #8: Cache risultati per 2min per ridurre carico API esterna
    */
   private async testProxyConnection(): Promise<boolean> {
     if (!this.localProxy?.enabled) {
       return true; // Nessun proxy configurato
+    }
+
+    // ✅ FIX #8: Verifica cache (evita chiamate ripetute a api.ipify.org)
+    const proxyKey = `${this.localProxy.host}:${this.localProxy.port}`;
+    const cached = this.proxyTestCache.get(proxyKey);
+
+    if (cached && Date.now() - cached.timestamp < this.PROXY_TEST_CACHE_TTL) {
+      this.logger.verbose(
+        `[HealthCheck] Instance ${this.instance.name} - Using cached proxy test result: ${cached.result}`,
+      );
+      return cached.result;
     }
 
     try {
@@ -943,13 +1034,19 @@ export class BaileysStartupService extends ChannelStartupService {
         this.logger.verbose(
           `[HealthCheck] Instance ${this.instance.name} - Proxy test successful (IP: ${response.data.ip})`,
         );
+        // ✅ FIX #8: Salva in cache
+        this.proxyTestCache.set(proxyKey, { result: true, timestamp: Date.now() });
         return true;
       }
 
       this.logger.warn(`[HealthCheck] Instance ${this.instance.name} - Proxy test returned unexpected response`);
+      // ✅ FIX #8: Salva in cache
+      this.proxyTestCache.set(proxyKey, { result: false, timestamp: Date.now() });
       return false;
     } catch (error) {
       this.logger.warn(`[HealthCheck] Instance ${this.instance.name} - Proxy test failed: ${error.message}`);
+      // ✅ FIX #8: Salva in cache
+      this.proxyTestCache.set(proxyKey, { result: false, timestamp: Date.now() });
       return false;
     }
   }
@@ -959,10 +1056,63 @@ export class BaileysStartupService extends ChannelStartupService {
    */
   private async forceRestart(reason: string) {
     try {
-      this.logger.warn(`[ForceRestart] Instance ${this.instance.name} - Forcing restart. Reason: ${reason}`);
+      // ✅ FIX #1: Previeni race condition - skip se già in restart
+      if (this.isAutoRestarting) {
+        this.logger.warn(`[ForceRestart] Instance ${this.instance.name} - Already restarting, skipping duplicate call`);
+        return;
+      }
+
+      // ✅ FIX #2: Check max attempts
+      if (this.forceRestartAttempts >= this.MAX_FORCE_RESTART_ATTEMPTS) {
+        this.logger.error(
+          `[ForceRestart] Instance ${this.instance.name} - Max attempts reached (${this.forceRestartAttempts}/${this.MAX_FORCE_RESTART_ATTEMPTS}). Giving up. Manual intervention required.`,
+        );
+
+        this.sendDataWebhook(Events.INSTANCE_STUCK, {
+          instance: this.instance.name,
+          state: this.stateConnection.state,
+          action: 'max_force_restart_attempts_reached',
+          reason: 'instance_unrecoverable',
+          attempts: this.forceRestartAttempts,
+          maxAttempts: this.MAX_FORCE_RESTART_ATTEMPTS,
+        });
+
+        return;
+      }
+
+      // ✅ FIX #2: Rate limiting - minimo 5s tra force restart
+      const now = Date.now();
+      const timeSinceLastRestart = now - this.lastForceRestartTime;
+
+      if (timeSinceLastRestart < this.MIN_FORCE_RESTART_INTERVAL) {
+        this.logger.warn(
+          `[ForceRestart] Instance ${this.instance.name} - Too soon since last restart (${timeSinceLastRestart}ms < ${this.MIN_FORCE_RESTART_INTERVAL}ms). Skipping.`,
+        );
+        return;
+      }
+
+      this.lastForceRestartTime = now;
+      this.forceRestartAttempts++;
+
+      this.logger.warn(
+        `[ForceRestart] Instance ${this.instance.name} - Forcing restart (attempt ${this.forceRestartAttempts}/${this.MAX_FORCE_RESTART_ATTEMPTS}). Reason: ${reason}`,
+      );
+
+      // ✅ FIX #1: Cancella auto-restart timer se attivo (previene conflitto)
+      if (this.connectingTimer) {
+        clearTimeout(this.connectingTimer);
+        this.connectingTimer = null;
+      }
+
+      // ✅ FIX #1: Cancella safety timeout precedente se esiste
+      if (this.safetyTimeout) {
+        clearTimeout(this.safetyTimeout);
+        this.safetyTimeout = null;
+      }
 
       // Marca come auto-restarting per evitare conflitti
       this.isAutoRestarting = true;
+      this.isAutoRestartTriggered = true; // ✅ FIX #15: Consistenza flag
 
       // Chiudi completamente il client
       if (this.client) {
@@ -988,9 +1138,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
       this.logger.info(`[ForceRestart] Instance ${this.instance.name} - Restart completed`);
 
+      // ✅ FIX #1: Salva safety timeout per poterlo cancellare
       // Safety timeout: reset flag se non raggiunge 'open' entro 30s
-      // Questo previene deadlock se proxy rimane down o connessione fallisce
-      setTimeout(() => {
+      this.safetyTimeout = setTimeout(() => {
         if (this.isAutoRestarting && this.stateConnection.state !== 'open') {
           this.logger.warn(
             `[ForceRestart] Instance ${this.instance.name} - Safety timeout: still in '${this.stateConnection.state}' after 30s, resetting isAutoRestarting flag to allow reconnection attempts`,
@@ -1006,10 +1156,17 @@ export class BaileysStartupService extends ChannelStartupService {
             timeout: 30000,
           });
         }
-      }, 30000); // 30 secondi
+        this.safetyTimeout = null; // ✅ Cleanup
+      }, 30000);
     } catch (error) {
       this.logger.error(`[ForceRestart] Instance ${this.instance.name} - Failed: ${error.toString()}`);
       this.isAutoRestarting = false;
+
+      // ✅ FIX #1: Cleanup safety timeout anche su exception
+      if (this.safetyTimeout) {
+        clearTimeout(this.safetyTimeout);
+        this.safetyTimeout = null;
+      }
     }
   }
 
@@ -2263,7 +2420,8 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         if (events['connection.update']) {
-          this.connectionUpdate(events['connection.update']);
+          // ✅ FIX #9: Await per sequenzializzare eventi e prevenire race conditions
+          await this.connectionUpdate(events['connection.update']);
         }
 
         if (events['creds.update']) {

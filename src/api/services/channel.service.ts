@@ -38,6 +38,9 @@ export class ChannelStartupService {
   public readonly localSettings: wa.LocalSettings = {};
   public readonly localWebhook: wa.LocalWebHook = {};
 
+  // ✅ FIX #7: Mutex per loadProxy - previene race condition
+  private loadProxyLock = false;
+
   public chatwootService = new ChatwootService(
     waMonitor,
     this.configService,
@@ -362,31 +365,45 @@ export class ChannelStartupService {
   }
 
   public async loadProxy() {
-    this.localProxy.enabled = false;
-
-    const proxyConfig = this.configService.get<Proxy>('PROXY');
-    if (proxyConfig.HOST) {
-      this.localProxy.enabled = true;
-      this.localProxy.host = proxyConfig.HOST;
-      this.localProxy.port = proxyConfig.PORT || '80';
-      this.localProxy.protocol = proxyConfig.PROTOCOL || 'http';
-      this.localProxy.username = proxyConfig.USERNAME;
-      this.localProxy.password = proxyConfig.PASSWORD;
+    // ✅ FIX #7: Mutex per prevenire race condition su loadProxy concorrente
+    if (this.loadProxyLock) {
+      this.logger.verbose('loadProxy already in progress, waiting...');
+      // Attendi 100ms e riprova
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return this.loadProxy();
     }
 
-    const data = await this.prismaRepository.proxy.findUnique({
-      where: {
-        instanceId: this.instanceId,
-      },
-    });
+    this.loadProxyLock = true;
 
-    if (data?.enabled) {
-      this.localProxy.enabled = true;
-      this.localProxy.host = data?.host;
-      this.localProxy.port = data?.port;
-      this.localProxy.protocol = data?.protocol;
-      this.localProxy.username = data?.username;
-      this.localProxy.password = data?.password;
+    try {
+      this.localProxy.enabled = false;
+
+      const proxyConfig = this.configService.get<Proxy>('PROXY');
+      if (proxyConfig.HOST) {
+        this.localProxy.enabled = true;
+        this.localProxy.host = proxyConfig.HOST;
+        this.localProxy.port = proxyConfig.PORT || '80';
+        this.localProxy.protocol = proxyConfig.PROTOCOL || 'http';
+        this.localProxy.username = proxyConfig.USERNAME;
+        this.localProxy.password = proxyConfig.PASSWORD;
+      }
+
+      const data = await this.prismaRepository.proxy.findUnique({
+        where: {
+          instanceId: this.instanceId,
+        },
+      });
+
+      if (data?.enabled) {
+        this.localProxy.enabled = true;
+        this.localProxy.host = data?.host;
+        this.localProxy.port = data?.port;
+        this.localProxy.protocol = data?.protocol;
+        this.localProxy.username = data?.username;
+        this.localProxy.password = data?.password;
+      }
+    } finally {
+      this.loadProxyLock = false;
     }
   }
 
