@@ -813,6 +813,34 @@ export class BaileysStartupService extends ChannelStartupService {
       `[HealthCheck] Instance ${this.instance.name} - State: ${state}, Age: ${Math.round(stateAge / 1000)}s`,
     );
 
+    // 0. Rileva flag isAutoRestarting bloccato (backup safety net se timeout in forceRestart fallisce)
+    if (this.isAutoRestarting && state !== 'open' && stateAge > 60000) {
+      this.logger.error(
+        `[HealthCheck] Instance ${this.instance.name} - isAutoRestarting flag stuck for ${Math.round(stateAge / 1000)}s in state '${state}'. Forcing flag reset to allow reconnection.`,
+      );
+
+      this.sendDataWebhook(Events.INSTANCE_STUCK, {
+        instance: this.instance.name,
+        state: state,
+        stuckDuration: Math.round(stateAge / 1000),
+        threshold: 60000,
+        lastStateChange: new Date(this.lastStateChangeTimestamp).toISOString(),
+        action: 'reset_isAutoRestarting_flag',
+        reason: 'auto_restart_flag_stuck',
+      });
+
+      this.isAutoRestarting = false;
+      this.isAutoRestartTriggered = false;
+      this.wasOpenBeforeReconnect = false;
+      this.autoRestartAttempts = 0;
+
+      this.logger.warn(
+        `[HealthCheck] Instance ${this.instance.name} - Flags reset. Will attempt reconnection on next 'close' event.`,
+      );
+
+      return;
+    }
+
     // 1. Rileva istanze bloccate in 'connecting' per più di 30 secondi - MA solo se già connesse prima
     if (state === 'connecting' && stateAge > this.stuckInConnectingThreshold) {
       // ✅ NUOVA LOGICA: Verifica se è prima connessione (aspetta QR code)
@@ -959,6 +987,26 @@ export class BaileysStartupService extends ChannelStartupService {
       await this.connectToWhatsapp(this.phoneNumber);
 
       this.logger.info(`[ForceRestart] Instance ${this.instance.name} - Restart completed`);
+
+      // Safety timeout: reset flag se non raggiunge 'open' entro 30s
+      // Questo previene deadlock se proxy rimane down o connessione fallisce
+      setTimeout(() => {
+        if (this.isAutoRestarting && this.stateConnection.state !== 'open') {
+          this.logger.warn(
+            `[ForceRestart] Instance ${this.instance.name} - Safety timeout: still in '${this.stateConnection.state}' after 30s, resetting isAutoRestarting flag to allow reconnection attempts`,
+          );
+          this.isAutoRestarting = false;
+
+          // Webhook per monitoraggio esterno
+          this.sendDataWebhook(Events.INSTANCE_STUCK, {
+            instance: this.instance.name,
+            state: this.stateConnection.state,
+            action: 'reset_isAutoRestarting_flag',
+            reason: 'force_restart_timeout',
+            timeout: 30000,
+          });
+        }
+      }, 30000); // 30 secondi
     } catch (error) {
       this.logger.error(`[ForceRestart] Instance ${this.instance.name} - Failed: ${error.toString()}`);
       this.isAutoRestarting = false;
