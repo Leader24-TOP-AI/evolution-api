@@ -131,7 +131,35 @@ export class LogsController {
     // Invia un ping iniziale per confermare connessione
     res.write('data: {"type":"connected"}\n\n');
 
-    // Usa tail -f per seguire il log in real-time
+    // Invia log iniziali (stessi che user vedeva in static mode - default 200)
+    // Questo garantisce continuità visiva quando switcha da static a live
+    const initialLines = parseInt(req.query.lines as string) || 200;
+
+    execAsync(`tail -n ${initialLines} "${outLogPath}"`)
+      .then(({ stdout }) => {
+        const lines = stdout.split('\n').filter(Boolean);
+
+        lines.forEach((line) => {
+          const parsed = this.parseLogLine(line);
+
+          // Applica gli stessi filtri di tail -f
+          if (level && level !== 'all' && parsed.level.toLowerCase() !== level.toLowerCase()) {
+            return;
+          }
+
+          if (instance && parsed.instance !== instance) {
+            return;
+          }
+
+          // Invia log via SSE
+          res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+        });
+      })
+      .catch((error) => {
+        console.warn('[SSE] Error sending initial logs:', error.message);
+      });
+
+    // POI avvia tail -f per seguire nuovi log in real-time
     const tailProcess = exec(`tail -f "${outLogPath}"`);
 
     tailProcess.stdout?.on('data', (data: Buffer) => {
