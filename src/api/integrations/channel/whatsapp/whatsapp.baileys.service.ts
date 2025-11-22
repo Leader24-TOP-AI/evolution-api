@@ -650,9 +650,9 @@ export class BaileysStartupService extends ChannelStartupService {
     if (connection === 'connecting') {
       this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
 
-      // ✅ FIX #5: Ferma health check durante connecting (verrà riavviato in 'open')
-      // Evita spreco risorse e possibili conflitti con auto-restart
-      this.stopHealthCheck();
+      // ✅ FIX #17: Health check continua durante connecting per backup safety net
+      // Log condizionale (FIX #11) previene spam
+      // Health check backup può rilevare flag bloccati anche durante connecting
 
       // Auto-restart logic quando l'istanza rimane in connecting (es. proxy IP change)
       // Usa flag wasOpenBeforeReconnect invece di lastConnectionState per evitare false negative
@@ -784,14 +784,47 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.info(
         `[Auto-Restart] Instance ${this.instance.name} - Controller reconnection completed. Waiting for connection state update...`,
       );
+
+      // ✅ FIX #16: Safety timeout (CRITICO - mancava e causava deadlock 04:28)
+      // Previene deadlock se connessione non raggiunge 'open' entro 30s
+      // Identico a forceRestart() per consistenza
+      if (this.safetyTimeout) {
+        clearTimeout(this.safetyTimeout);
+        this.safetyTimeout = null;
+      }
+
+      this.safetyTimeout = setTimeout(() => {
+        if (this.isAutoRestarting && this.stateConnection.state !== 'open') {
+          this.logger.warn(
+            `[Auto-Restart] Instance ${this.instance.name} - Safety timeout: still in '${this.stateConnection.state}' after 30s, resetting isAutoRestarting flag to allow reconnection attempts`,
+          );
+          this.isAutoRestarting = false;
+          this.isAutoRestartTriggered = false;
+
+          // Webhook per monitoraggio esterno
+          this.sendDataWebhook(Events.INSTANCE_STUCK, {
+            instance: this.instance.name,
+            state: this.stateConnection.state,
+            action: 'reset_isAutoRestarting_flag',
+            reason: 'auto_restart_timeout',
+            timeout: 30000,
+          });
+        }
+        this.safetyTimeout = null; // Cleanup
+      }, 30000); // 30 secondi
     } catch (error) {
       this.logger.error(`[Auto-Restart] Instance ${this.instance.name} - Failed: ${error.toString()}`);
       // Reset flag su errore
       this.isAutoRestarting = false;
       this.isAutoRestartTriggered = false;
+
+      // ✅ FIX #16: Cleanup safety timeout anche su exception
+      if (this.safetyTimeout) {
+        clearTimeout(this.safetyTimeout);
+        this.safetyTimeout = null;
+      }
     }
-    // NOTA: isAutoRestarting NON viene resettato qui per evitare race conditions
-    // Sarà resettato quando lo stato diventa 'open' (successo) o 'close' definitivo (fallimento)
+    // NOTA: isAutoRestarting normalmente resettato dal safety timeout o quando stato diventa 'open'
   }
 
   private waitForState(expectedState: string, timeoutMs: number): Promise<boolean> {
