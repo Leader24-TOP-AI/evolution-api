@@ -298,69 +298,37 @@ git push origin main
 
 ---
 
-## Critical Bug Fixes and Resolutions
+## Known Issues and Troubleshooting
 
-### ✅ FIX: WhatsApp Instance Stuck in "connecting" State (Nov 2025)
+### WhatsApp Instance Connection Stability
 
-**Problem**: WhatsApp instances would get stuck in "connecting" state after disconnection (statusCode 408/428) and never recover automatically, requiring manual restart from dashboard.
+**Issue**: After extended periods of connection (several hours), WhatsApp instances may experience disconnections with statusCode 408 (timeout) or 428 (connection closed), typically related to proxy IP changes or network instability.
 
-**Root Cause**: Deadlock in auto-restart system where `isAutoRestarting` flag blocked timer activation:
-1. Auto-restart sets `isAutoRestarting = true`
-2. Creates new client → enters "connecting" state
-3. Timer checks `!isAutoRestarting` before starting → FALSE
-4. Timer never starts → Instance stuck forever
-5. Manual restart worked because it didn't set the flag
+**System Behavior**:
+- Instances have automatic reconnection system with multiple safety nets
+- Auto-restart timer (5s) for quick recovery
+- Health check monitoring (every 60s, detects stuck state within 10s)
+- Safety timeout (30s) as final fallback
 
-**Solution Implemented** (File: `src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts`):
+**Expected Recovery Time**:
+- Normal disconnection: 2-5 seconds (automatic)
+- Stuck in connecting: 5-15 seconds (auto-restart triggered)
 
-1. **New `cleanupClient()` function** (lines 856-913):
-   - Complete cleanup of WebSocket, Baileys client, and timers
-   - Consistent cleanup across all restart paths
-   - Prevents memory leaks and resource conflicts
+**If Manual Intervention Needed**:
+- Dashboard restart button available per instance
+- API endpoint: `POST /instance/restart/:instanceName`
+- Test endpoint for validation: `POST /instance/simulate-disconnect/:instanceName`
 
-2. **New `isRestartInProgress` flag** (line 265):
-   - Separate lock for preventing duplicate restart calls
-   - Doesn't block timer activation (solves deadlock)
-   - More granular control than `isAutoRestarting`
+**Monitoring**:
+```bash
+# Watch instance health
+pm2 logs evolution-api | grep "Auto-Restart\|HealthCheck\|CONNECTED"
 
-3. **`autoRestart()` rewritten** (lines 728-892):
-   - Resets `isAutoRestarting = false` BEFORE creating new client (line 810)
-   - Direct call to `createClient()` instead of controller (line 816)
-   - Improved safety timeout: triggers force close instead of just resetting flag
-   - Preserves `wasOpenBeforeReconnect` across timeouts
-   - Detailed logging with emojis and timestamps
-
-4. **`forceRestart()` rewritten** (lines 1205-1373):
-   - Same deadlock fix applied
-   - Consistent with `autoRestart()` behavior
-   - Uses `cleanupClient()` for cleanup
-
-5. **Health check optimized** (line 272):
-   - `stuckInConnectingThreshold` reduced from 30s to 10s
-   - 3x faster detection of stuck instances
-   - More reactive backup system
-
-6. **`connectionUpdate()` updated**:
-   - Uses `isRestartInProgress` in timer condition (line 680)
-   - Timer can now start during auto-restart
-   - Detailed logging with all flags for debugging
-
-**Expected Behavior After Fix**:
-- Auto-recovery within 5-15 seconds from disconnection
-- No more infinite stuck states
-- Triple safety net:
-  1. Auto-restart timer (5s)
-  2. Health check backup (10s)
-  3. Safety timeout force close (30s)
-
-**Monitoring**: Watch for these log patterns to verify fix is working:
-```
-[Auto-Restart] Instance xxx - 🔓 Resetting isAutoRestarting flag  ← Fix applied
-[Auto-Restart] Instance xxx - 🔌 Creating new client               ← Direct call
-[Auto-Restart] Instance xxx - SUCCESS! Connection restored         ← Auto-recovery
+# Test auto-reconnection
+npm run test:reconnect
 ```
 
-**Files Modified**:
-- `src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts`
-
-**Date**: November 22, 2025
+**Related Files**:
+- Connection management: `src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts`
+- Instance monitoring: `src/api/services/monitor.service.ts`
+- Test utilities: `test/reconnect-test.ts` (if present)
