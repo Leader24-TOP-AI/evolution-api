@@ -75,6 +75,7 @@ model Instance {
   disconnectionReasonCode Int?                     @db.Int
   disconnectionObject     Json?                    @db.Json
   disconnectionAt         DateTime?                @db.Timestamp
+  definitiveLogout        Boolean                  @default(false) @map("definitive_logout")
   createdAt               DateTime?                @default(dbgenerated("CURRENT_TIMESTAMP")) @db.Timestamp
   updatedAt               DateTime?                @updatedAt @db.Timestamp
   Chat                    Chat[]

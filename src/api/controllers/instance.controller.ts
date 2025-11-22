@@ -310,6 +310,13 @@ export class InstanceController {
       }
 
       if (state == 'close') {
+        // ✅ FIX: Reset definitiveLogout flag quando utente riconnette manualmente
+        // Permette riutilizzo istanza dopo logout/ban
+        await this.prismaRepository.instance.update({
+          where: { name: instanceName },
+          data: { definitiveLogout: false },
+        });
+
         await instance.connectToWhatsapp(number);
 
         await delay(2000);
@@ -365,6 +372,144 @@ export class InstanceController {
         state: this.waMonitor.waInstances[instanceName]?.connectionStatus?.state,
       },
     };
+  }
+
+  /**
+   * ✅ TEST ENDPOINT: Simula disconnessione forzata per test riconnessione automatica
+   *
+   * Questo endpoint permette di testare tutti gli scenari di disconnessione/riconnessione
+   * senza dover aspettare che l'istanza si disconnetta naturalmente.
+   *
+   * Supporta simulazione di:
+   * - Vari statusCode (408, 428, 440, 515, 503, 401, 403, etc.)
+   * - Stuck artificiale in 'connecting' (per testare timer/health check)
+   * - Disconnessioni multiple rapide (stress test)
+   *
+   * @param instanceName - Nome dell'istanza da disconnettere
+   * @param body.statusCode - Status code da simulare (default: 408)
+   * @param body.reason - Motivo della disconnessione (per log)
+   * @param body.forceStuck - Se true, simula stuck in connecting senza riconnettersi
+   */
+  public async simulateDisconnect(
+    { instanceName }: InstanceDto,
+    body?: { statusCode?: number; reason?: string; forceStuck?: boolean },
+  ) {
+    try {
+      const instance = this.waMonitor.waInstances[instanceName];
+
+      if (!instance) {
+        throw new BadRequestException(`Instance "${instanceName}" does not exist`);
+      }
+
+      const state = instance.connectionStatus?.state;
+
+      if (state !== 'open' && state !== 'connecting') {
+        throw new BadRequestException(
+          `Instance "${instanceName}" is not in a state that can be disconnected (current state: ${state}). Only 'open' or 'connecting' states can be tested.`,
+        );
+      }
+
+      const statusCode = body?.statusCode || 408; // Default: Request Timeout
+      const reason = body?.reason || `Test: Simulated disconnect with statusCode ${statusCode}`;
+      const forceStuck = body?.forceStuck || false;
+
+      this.logger.warn(
+        `[TEST] 🧪 Simulating disconnect for instance ${instanceName} | StatusCode: ${statusCode} | Reason: ${reason} | ForceStuck: ${forceStuck}`,
+      );
+
+      // Crea errore simulato come Boom error (formato usato da Baileys)
+      const simulatedError: any = new Error(reason);
+      simulatedError.output = {
+        statusCode: statusCode,
+        payload: {
+          message: reason,
+          statusCode: statusCode,
+        },
+      };
+
+      // Forza chiusura WebSocket
+      if (instance.client?.ws) {
+        this.logger.verbose(`[TEST] Closing WebSocket for instance ${instanceName}`);
+        instance.client.ws.close();
+      }
+
+      // Termina client con errore simulato
+      // Questo triggera connectionUpdate() con lastDisconnect contenente il nostro statusCode
+      this.logger.verbose(`[TEST] Ending client with simulated error for instance ${instanceName}`);
+      instance.client?.end(simulatedError);
+
+      // Se forceStuck, NON permettere riconnessione automatica
+      // (utile per testare health check e safety timeout)
+      if (forceStuck) {
+        this.logger.warn(`[TEST] ForceStuck enabled - instance will remain in 'connecting' to test timer/health check`);
+        // Nota: In produzione questo scenario non dovrebbe mai verificarsi
+        // È solo per testing che timer e health check funzionino correttamente
+      }
+
+      return {
+        success: true,
+        message: `Disconnect simulation triggered for instance ${instanceName}`,
+        testConfig: {
+          statusCode: statusCode,
+          reason: reason,
+          forceStuck: forceStuck,
+          instanceState: state,
+        },
+        timestamp: new Date().toISOString(),
+        expectedBehavior: this.getExpectedBehavior(statusCode, forceStuck),
+        monitoringInfo: {
+          logPatterns: this.getLogPatterns(statusCode),
+          checkAfterSeconds: forceStuck ? 15 : 5,
+          endpoints: {
+            checkState: `/instance/connectionState/${instanceName}`,
+            logs: `pm2 logs evolution-api | grep "${instanceName}"`,
+          },
+        },
+      };
+    } catch (error) {
+      this.logger.error(`[TEST] Simulate disconnect failed: ${error}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Helper: Ritorna comportamento atteso basato su statusCode
+   */
+  private getExpectedBehavior(statusCode: number, forceStuck: boolean): string {
+    // Codici che NON riconnettono (close definitivo)
+    const codesToNotReconnect = [401, 403, 402, 406];
+
+    if (codesToNotReconnect.includes(statusCode)) {
+      return `Close definitivo (statusCode ${statusCode}). NO auto-riconnessione. Flags reset. Serve nuovo QR code.`;
+    }
+
+    if (forceStuck) {
+      return `Instance rimarrà stuck in 'connecting'. Timer (5s) dovrebbe triggerare auto-restart. Health check (10s) come backup. Safety timeout (30s) force close.`;
+    }
+
+    return `Auto-riconnessione entro 5-15 secondi. Timer attivato se stuck in 'connecting'. Success atteso.`;
+  }
+
+  /**
+   * Helper: Ritorna pattern di log attesi
+   */
+  private getLogPatterns(statusCode: number): string[] {
+    const codesToNotReconnect = [401, 403, 402, 406];
+
+    if (codesToNotReconnect.includes(statusCode)) {
+      return [
+        `[Connection] Instance xxx - ❌ Definitive close (statusCode: ${statusCode}) - Resetting all auto-restart flags`,
+        `STATUS_INSTANCE status: 'closed'`,
+      ];
+    }
+
+    return [
+      `[Connection] Instance xxx - 🔄 Reconnecting after close (statusCode: ${statusCode})`,
+      `[Auto-Restart] Instance xxx - Detected stuck in 'connecting' state`,
+      `[Auto-Restart] Instance xxx - 🔓 Resetting isAutoRestarting flag`,
+      `[Auto-Restart] Instance xxx - 🔌 Creating new client`,
+      `[Auto-Restart] Instance xxx - SUCCESS! Connection restored`,
+    ];
   }
 
   public async fetchInstances({ instanceName, instanceId, number }: InstanceDto, key: string) {

@@ -145,9 +145,13 @@ export class WAMonitoringService {
       });
 
       if (findInstance) {
+        // ✅ FIX: Setta definitiveLogout = true per prevenire auto-reload
         const instance = await this.prismaRepository.instance.update({
           where: { name: instanceName },
-          data: { connectionStatus: 'close' },
+          data: {
+            connectionStatus: 'close',
+            definitiveLogout: true, // ← Previene auto-reload dopo logout/forbidden/ban
+          },
         });
 
         rmSync(join(INSTANCE_DIR, instance.id), { recursive: true, force: true });
@@ -310,8 +314,13 @@ export class WAMonitoringService {
   private async loadInstancesFromDatabasePostgres() {
     const clientName = await this.configService.get<Database>('DATABASE').CONNECTION.CLIENT_NAME;
 
+    // ✅ FIX: Escludi istanze con logout definitivo (401, 403, 402, 406)
+    // Previene auto-reload e generazione QR code per istanze bannate/logout
     const instances = await this.prismaRepository.instance.findMany({
-      where: { clientName: clientName },
+      where: {
+        clientName: clientName,
+        definitiveLogout: false, // ← Filtra istanze con close definitivo
+      },
     });
 
     if (instances.length === 0) {
