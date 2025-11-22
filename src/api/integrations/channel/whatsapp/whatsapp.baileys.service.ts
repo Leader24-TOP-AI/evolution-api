@@ -261,12 +261,15 @@ export class BaileysStartupService extends ChannelStartupService {
   private isAutoRestarting: boolean = false;
   private wasOpenBeforeReconnect: boolean = false;
   private isAutoRestartTriggered: boolean = false;
+  // ✅ FIX DEFINITIVO: Nuovo flag per prevenire race conditions senza bloccare timer
+  private isRestartInProgress: boolean = false;
 
   // ✅ FASE 2: Health Check System
   private healthCheckTimer: NodeJS.Timeout | null = null;
   private lastStateChangeTimestamp: number = Date.now();
   private healthCheckInterval = 60000; // 60 secondi
-  private stuckInConnectingThreshold = 30000; // 30 secondi
+  // ✅ FIX DEFINITIVO: Ridotto da 30s a 10s per detection più veloce delle istanze stuck
+  private stuckInConnectingThreshold = 10000; // 10 secondi (era 30s)
 
   // ✅ FASE 3: Auto-restart optimization
   private readonly autoRestartTimerMs = 5000; // 5 secondi (ridotto da 15s per recovery più veloce)
@@ -296,26 +299,26 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    this.logger.info(`[Logout] Instance ${this.instance.name} - Starting logout process...`);
+
     this.messageProcessor.onDestroy();
 
-    // Cleanup auto-restart timer se attivo
-    if (this.connectingTimer) {
-      clearTimeout(this.connectingTimer);
-      this.connectingTimer = null;
-    }
+    // ✅ FIX DEFINITIVO: Usa cleanupClient() per cleanup completo e consistente
+    this.logger.info(`[Logout] Instance ${this.instance.name} - 🧹 Performing complete client cleanup...`);
+    this.cleanupClient('logout');
 
-    // ✅ FASE 2: Cleanup health check timer
+    // Ferma health check
     this.stopHealthCheck();
 
-    // ✅ FIX #1: Cleanup safety timeout
-    if (this.safetyTimeout) {
-      clearTimeout(this.safetyTimeout);
-      this.safetyTimeout = null;
-    }
+    // Reset tutti i flag
+    this.isAutoRestarting = false;
+    this.isAutoRestartTriggered = false;
+    this.isRestartInProgress = false;
+    this.wasOpenBeforeReconnect = false;
+    this.autoRestartAttempts = 0;
+    this.forceRestartAttempts = 0;
 
     await this.client?.logout('Log out instance: ' + this.instanceName);
-
-    this.client?.ws?.close();
 
     // ✅ FIX #6: Reset ownerJid al logout per permettere riuso nome istanza
     await this.prismaRepository.instance.update({
@@ -485,10 +488,11 @@ export class BaileysStartupService extends ChannelStartupService {
         // Se era 'open' e stiamo per riconnettere, potrebbe essere un cambio IP proxy
         this.wasOpenBeforeReconnect = wasOpenBeforeClose;
 
-        // NON riconnettere se auto-restart è già in corso (evita doppia chiamata)
-        if (!this.isAutoRestarting) {
+        // ✅ FIX DEFINITIVO: NON riconnettere se restart è già in corso (evita doppia chiamata)
+        // Usa isRestartInProgress invece di isAutoRestarting per maggiore precisione
+        if (!this.isRestartInProgress && !this.isAutoRestarting) {
           this.logger.info(
-            `[Connection] Instance ${this.instance.name} - Reconnecting after close (statusCode: ${statusCode})`,
+            `[Connection] Instance ${this.instance.name} - 🔄 Reconnecting after close (statusCode: ${statusCode})`,
           );
 
           // ✅ FASE 1 FIX: Ricarica proxy configuration dal DB PRIMA di riconnettere
@@ -513,16 +517,17 @@ export class BaileysStartupService extends ChannelStartupService {
           await this.connectToWhatsapp(this.phoneNumber);
         } else {
           this.logger.info(
-            `[Connection] Instance ${this.instance.name} - Skipping auto-reconnect (auto-restart in progress)`,
+            `[Connection] Instance ${this.instance.name} - ⏸️ Skipping auto-reconnect (restart operation in progress: isRestartInProgress=${this.isRestartInProgress}, isAutoRestarting=${this.isAutoRestarting})`,
           );
         }
       } else {
         // Close definitivo (logout, forbidden, etc.) - Reset tutti i flag auto-restart
         this.logger.warn(
-          `[Connection] Instance ${this.instance.name} - Definitive close (statusCode: ${statusCode}) - Resetting auto-restart flags`,
+          `[Connection] Instance ${this.instance.name} - ❌ Definitive close (statusCode: ${statusCode}) - Resetting all auto-restart flags`,
         );
         this.isAutoRestarting = false;
         this.isAutoRestartTriggered = false;
+        this.isRestartInProgress = false; // ← Nuovo flag
         this.wasOpenBeforeReconnect = false;
         this.autoRestartAttempts = 0;
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
@@ -579,11 +584,12 @@ export class BaileysStartupService extends ChannelStartupService {
         this.safetyTimeout = null;
       }
 
-      // Reset tutti i flag auto-restart
+      // ✅ FIX DEFINITIVO: Reset tutti i flag auto-restart quando connessione OK
       this.autoRestartAttempts = 0;
       this.wasOpenBeforeReconnect = false;
       this.isAutoRestarting = false;
       this.isAutoRestartTriggered = false;
+      this.isRestartInProgress = false; // ← Nuovo flag
       this.lastConnectionState = 'open';
 
       // ✅ FIX #2: Reset force restart attempts su SUCCESS
@@ -661,15 +667,17 @@ export class BaileysStartupService extends ChannelStartupService {
       // ✅ FASE 2: Update timestamp quando entra in connecting
       this.lastStateChangeTimestamp = Date.now();
 
-      // Log dettagliato per debug
+      // ✅ FIX DEFINITIVO: Log dettagliato con tutti i flag per debug completo
       this.logger.verbose(
-        `[Connection] Instance ${this.instance.name} - State: connecting | Flags: wasOpenBeforeReconnect=${this.wasOpenBeforeReconnect}, isAutoRestarting=${this.isAutoRestarting}, attempts=${this.autoRestartAttempts}/${this.maxAutoRestartAttempts}`,
+        `[Connection] Instance ${this.instance.name} - State: connecting | Flags: wasOpenBeforeReconnect=${this.wasOpenBeforeReconnect}, isAutoRestarting=${this.isAutoRestarting}, isRestartInProgress=${this.isRestartInProgress}, attempts=${this.autoRestartAttempts}/${this.maxAutoRestartAttempts}`,
       );
 
-      // ✅ FASE 3: Timer ridotto a 5s e max attempts a 10
+      // ✅ FIX DEFINITIVO: Usa isRestartInProgress invece di isAutoRestarting
+      // Questo permette al timer di avviarsi anche durante auto-restart
+      // perché isAutoRestarting viene resettato PRIMA di createClient()
       if (
         this.wasOpenBeforeReconnect &&
-        !this.isAutoRestarting &&
+        !this.isRestartInProgress &&
         this.autoRestartAttempts < this.maxAutoRestartAttempts
       ) {
         this.logger.warn(
@@ -696,135 +704,192 @@ export class BaileysStartupService extends ChannelStartupService {
           }
         }, this.autoRestartTimerMs);
       } else {
-        // Log perché il timer NON è stato avviato
+        // ✅ FIX DEFINITIVO: Log migliorato con spiegazione dettagliata
         if (!this.wasOpenBeforeReconnect) {
           this.logger.verbose(
-            `[Auto-Restart] Instance ${this.instance.name} - Timer NOT started: wasOpenBeforeReconnect is false`,
+            `[Auto-Restart] Instance ${this.instance.name} - ⏸️ Timer NOT started: wasOpenBeforeReconnect is false (first connection or definitive close)`,
           );
-        } else if (this.isAutoRestarting) {
+        } else if (this.isRestartInProgress) {
           this.logger.verbose(
-            `[Auto-Restart] Instance ${this.instance.name} - Timer NOT started: auto-restart already in progress`,
+            `[Auto-Restart] Instance ${this.instance.name} - ⏸️ Timer NOT started: restart operation in progress (isRestartInProgress=true)`,
           );
         } else if (this.autoRestartAttempts >= this.maxAutoRestartAttempts) {
           this.logger.error(
-            `[Auto-Restart] Instance ${this.instance.name} - Timer NOT started: max attempts reached (${this.autoRestartAttempts}/${this.maxAutoRestartAttempts}). Instance stuck in 'connecting' state!`,
+            `[Auto-Restart] Instance ${this.instance.name} - ❌ Timer NOT started: max attempts reached (${this.autoRestartAttempts}/${this.maxAutoRestartAttempts}). Instance stuck!`,
+          );
+        } else {
+          // Caso non previsto - log per debug
+          this.logger.warn(
+            `[Auto-Restart] Instance ${this.instance.name} - ⚠️ Timer NOT started: unexpected condition. Flags: wasOpenBeforeReconnect=${this.wasOpenBeforeReconnect}, isRestartInProgress=${this.isRestartInProgress}, attempts=${this.autoRestartAttempts}/${this.maxAutoRestartAttempts}`,
           );
         }
       }
     }
   }
 
+  /**
+   * ✅ FIX DEFINITIVO: Auto-restart completamente riscritto per risolvere deadlock
+   * PROBLEMA RISOLTO: Il vecchio codice settava isAutoRestarting=true e poi chiamava
+   * il controller, ma quando il nuovo client entrava in "connecting", il timer NON
+   * si avviava perché la condizione !isAutoRestarting era FALSE → deadlock
+   *
+   * SOLUZIONE: Resettare isAutoRestarting PRIMA di creare il nuovo client, così il
+   * timer può avviarsi normalmente quando entra in "connecting"
+   */
   private async autoRestart() {
+    const restartStartTime = Date.now();
+
     try {
-      this.isAutoRestarting = true;
+      // ✅ FIX: Previeni chiamate duplicate usando isRestartInProgress
+      if (this.isRestartInProgress) {
+        this.logger.warn(
+          `[Auto-Restart] Instance ${this.instance.name} - Restart already in progress, skipping duplicate call`,
+        );
+        return;
+      }
+
+      this.isRestartInProgress = true; // ← Lock per prevenire duplicati
       this.isAutoRestartTriggered = true;
       this.autoRestartAttempts++;
 
       const state = this.stateConnection.state;
 
       this.logger.warn(
-        `[Auto-Restart] Instance ${this.instance.name} - Attempt ${this.autoRestartAttempts}/${this.maxAutoRestartAttempts} - Current state: ${state} - Restarting via controller...`,
+        `[Auto-Restart] Instance ${this.instance.name} - ⚠️ STARTING ATTEMPT ${this.autoRestartAttempts}/${this.maxAutoRestartAttempts} | Current state: ${state} | Timestamp: ${new Date().toISOString()}`,
       );
 
       // Verifica stato (come fa il restart manuale del controller)
       if (state === 'close') {
         this.logger.error(
-          `[Auto-Restart] Instance ${this.instance.name} - Cannot restart: state is 'close' (definitively closed)`,
+          `[Auto-Restart] Instance ${this.instance.name} - ❌ Cannot restart: state is 'close' (definitively closed)`,
         );
-        this.isAutoRestarting = false;
+        this.isRestartInProgress = false;
         this.isAutoRestartTriggered = false;
         return;
       }
 
       // Cleanup cache solo se era in stato 'open'
       if (state === 'open' && this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
+        this.logger.verbose(`[Auto-Restart] Instance ${this.instance.name} - Clearing Chatwoot cache`);
         this.clearCacheChatwoot();
       }
 
-      // Chiude la connessione corrente (come restart manuale)
-      this.logger.info(
-        `[Auto-Restart] Instance ${this.instance.name} - Closing current connection (ws + client.end)...`,
-      );
-      this.client?.ws?.close();
-      this.client?.end(new Error('Auto-restart'));
+      // ✅ FIX: Usa cleanupClient() per cleanup completo e consistente
+      this.logger.info(`[Auto-Restart] Instance ${this.instance.name} - 🧹 Starting complete client cleanup...`);
+      this.cleanupClient('auto-restart');
 
-      // ✅ FIX RACE CONDITION: Aspetta che lo stato diventi 'close' prima di chiamare controller
+      // Aspetta che lo stato diventi 'close' prima di procedere
       this.logger.info(
-        `[Auto-Restart] Instance ${this.instance.name} - Waiting for state to become 'close' (max 5 seconds)...`,
+        `[Auto-Restart] Instance ${this.instance.name} - ⏳ Waiting for state to become 'close' (max 5s)...`,
       );
 
       const stateChanged = await this.waitForState('close', 5000);
 
       if (!stateChanged) {
         this.logger.error(
-          `[Auto-Restart] Instance ${this.instance.name} - Timeout: state did not become 'close' within 5 seconds. Current state: ${this.stateConnection.state}. Aborting restart.`,
+          `[Auto-Restart] Instance ${this.instance.name} - ❌ Timeout: state did not become 'close' within 5s. Current state: ${this.stateConnection.state}`,
         );
-        this.isAutoRestarting = false;
+        this.isRestartInProgress = false;
         this.isAutoRestartTriggered = false;
         return;
       }
 
       this.logger.info(
-        `[Auto-Restart] Instance ${this.instance.name} - State is now 'close'. Proceeding with controller reconnection...`,
+        `[Auto-Restart] Instance ${this.instance.name} - ✅ State is now 'close'. Proceeding with reconnection...`,
       );
 
-      // ✅ USA IL CONTROLLER (come restart manuale della dashboard)
-      // Import dinamico per evitare dipendenze circolari
-      const { instanceController } = await import('@api/server.module');
+      // ✅ FIX CRITICO: Ricarica proxy configuration dal DB PRIMA di riconnettere
+      this.logger.info(`[Auto-Restart] Instance ${this.instance.name} - 🔄 Reloading proxy configuration...`);
+      await this.loadProxy();
 
+      // ✅ FIX CRITICO: Reset isAutoRestarting PRIMA di creare nuovo client
+      // Questo permette al timer in connectionUpdate('connecting') di avviarsi normalmente
       this.logger.info(
-        `[Auto-Restart] Instance ${this.instance.name} - Calling instanceController.connectToWhatsapp()...`,
+        `[Auto-Restart] Instance ${this.instance.name} - 🔓 Resetting isAutoRestarting flag to allow timer activation`,
       );
+      this.isAutoRestarting = false; // ← FIX DEADLOCK PRINCIPALE
 
-      await instanceController.connectToWhatsapp({
-        instanceName: this.instance.name,
-        number: this.phoneNumber,
-      });
-
+      // ✅ FIX: Chiamata diretta a createClient invece di passare per controller
+      // Più efficiente e meno race conditions
       this.logger.info(
-        `[Auto-Restart] Instance ${this.instance.name} - Controller reconnection completed. Waiting for connection state update...`,
+        `[Auto-Restart] Instance ${this.instance.name} - 🔌 Creating new client (direct call to avoid controller overhead)...`,
+      );
+      await this.createClient(this.phoneNumber);
+
+      const restartDuration = Date.now() - restartStartTime;
+      this.logger.info(
+        `[Auto-Restart] Instance ${this.instance.name} - ✅ Client creation completed in ${restartDuration}ms. Waiting for connection state update...`,
       );
 
-      // ✅ FIX #16: Safety timeout (CRITICO - mancava e causava deadlock 04:28)
-      // Previene deadlock se connessione non raggiunge 'open' entro 30s
-      // Identico a forceRestart() per consistenza
+      // Reset lock dopo creazione client
+      this.isRestartInProgress = false;
+
+      // ✅ FIX: Safety timeout migliorato - Non solo reset flag ma TRIGGERA riconnessione attiva
       if (this.safetyTimeout) {
         clearTimeout(this.safetyTimeout);
         this.safetyTimeout = null;
       }
 
       this.safetyTimeout = setTimeout(() => {
-        if (this.isAutoRestarting && this.stateConnection.state !== 'open') {
-          this.logger.warn(
-            `[Auto-Restart] Instance ${this.instance.name} - Safety timeout: still in '${this.stateConnection.state}' after 30s, resetting isAutoRestarting flag to allow reconnection attempts`,
+        const currentState = this.stateConnection.state;
+
+        if (currentState !== 'open') {
+          this.logger.error(
+            `[Auto-Restart] Instance ${this.instance.name} - ⏰ Safety timeout: still in '${currentState}' after 30s`,
           );
+
+          // ✅ NUOVO: Invece di solo resettare flag, triggera FORCE CLOSE
+          // per forzare un nuovo evento 'close' che riattivi la riconnessione
+          if (currentState === 'connecting') {
+            this.logger.warn(
+              `[Auto-Restart] Instance ${this.instance.name} - 🔨 Forcing close to trigger new reconnection attempt...`,
+            );
+
+            // Forza close del client
+            if (this.client) {
+              this.client.ws?.close();
+              this.client.end(new Error('Safety timeout - forcing close to retry'));
+            }
+          }
+
+          // Reset flag per permettere nuovi tentativi
           this.isAutoRestarting = false;
           this.isAutoRestartTriggered = false;
+          this.isRestartInProgress = false;
 
-          // Webhook per monitoraggio esterno
+          // ✅ NUOVO: Preserva wasOpenBeforeReconnect anche dopo safety timeout
+          // (il vecchio codice lo perdeva, impedendo futuri auto-restart)
+          // this.wasOpenBeforeReconnect = this.wasOpenBeforeReconnect;  // Mantiene valore
+
           this.sendDataWebhook(Events.INSTANCE_STUCK, {
             instance: this.instance.name,
-            state: this.stateConnection.state,
-            action: 'reset_isAutoRestarting_flag',
+            state: currentState,
+            action: 'safety_timeout_triggered',
             reason: 'auto_restart_timeout',
             timeout: 30000,
+            nextAction: currentState === 'connecting' ? 'forced_close' : 'flag_reset',
           });
         }
-        this.safetyTimeout = null; // Cleanup
-      }, 30000); // 30 secondi
+        this.safetyTimeout = null;
+      }, 30000);
     } catch (error) {
-      this.logger.error(`[Auto-Restart] Instance ${this.instance.name} - Failed: ${error.toString()}`);
-      // Reset flag su errore
+      this.logger.error(
+        `[Auto-Restart] Instance ${this.instance.name} - ❌ Exception: ${error.toString()}\nStack: ${error.stack}`,
+      );
+
+      // Reset tutti i flag su errore
       this.isAutoRestarting = false;
       this.isAutoRestartTriggered = false;
+      this.isRestartInProgress = false;
 
-      // ✅ FIX #16: Cleanup safety timeout anche su exception
+      // Cleanup safety timeout
       if (this.safetyTimeout) {
         clearTimeout(this.safetyTimeout);
         this.safetyTimeout = null;
       }
     }
-    // NOTA: isAutoRestarting normalmente resettato dal safety timeout o quando stato diventa 'open'
+    // NOTA: isAutoRestarting viene resettato PRIMA di chiamare createClient (fix deadlock)
+    // Safety timeout si occupa di reset in caso di problemi
   }
 
   private waitForState(expectedState: string, timeoutMs: number): Promise<boolean> {
@@ -847,6 +912,62 @@ export class BaileysStartupService extends ChannelStartupService {
 
       checkState();
     });
+  }
+
+  /**
+   * ✅ FIX DEFINITIVO: Cleanup completo del client per prevenire memory leak e conflitti
+   * Questa funzione esegue una pulizia completa di tutte le risorse associate al client WhatsApp
+   */
+  private cleanupClient(reason: string = 'cleanup'): void {
+    const startTime = Date.now();
+    this.logger.info(`[Cleanup] Instance ${this.instance.name} - Starting complete client cleanup (reason: ${reason})`);
+
+    try {
+      // 1. Chiudi WebSocket se aperto
+      if (this.client?.ws) {
+        this.logger.verbose(`[Cleanup] Instance ${this.instance.name} - Closing WebSocket connection`);
+        try {
+          this.client.ws.close();
+        } catch (wsError) {
+          this.logger.warn(`[Cleanup] Instance ${this.instance.name} - WebSocket close error: ${wsError.message}`);
+        }
+      }
+
+      // 2. Termina il client Baileys
+      if (this.client) {
+        this.logger.verbose(`[Cleanup] Instance ${this.instance.name} - Ending Baileys client`);
+        try {
+          this.client.end(new Error(`Client cleanup: ${reason}`));
+        } catch (clientError) {
+          this.logger.warn(`[Cleanup] Instance ${this.instance.name} - Client end error: ${clientError.message}`);
+        }
+      }
+
+      // 3. Clear tutti i timer attivi
+      if (this.connectingTimer) {
+        this.logger.verbose(`[Cleanup] Instance ${this.instance.name} - Clearing connecting timer`);
+        clearTimeout(this.connectingTimer);
+        this.connectingTimer = null;
+      }
+
+      if (this.safetyTimeout) {
+        this.logger.verbose(`[Cleanup] Instance ${this.instance.name} - Clearing safety timeout`);
+        clearTimeout(this.safetyTimeout);
+        this.safetyTimeout = null;
+      }
+
+      // NOTA: NON fermiamo healthCheckTimer qui perché vogliamo che continui
+      // a monitorare anche durante la riconnessione
+
+      // 4. Nullifica reference del client (permette garbage collection)
+      // NOTA: Non settiamo this.client = null perché createClient() lo sovrascriverà
+      // e alcuni metodi potrebbero ancora referenziarlo durante la transizione
+
+      const cleanupDuration = Date.now() - startTime;
+      this.logger.info(`[Cleanup] Instance ${this.instance.name} - Client cleanup completed in ${cleanupDuration}ms`);
+    } catch (error) {
+      this.logger.error(`[Cleanup] Instance ${this.instance.name} - Error during cleanup: ${error.toString()}`);
+    }
   }
 
   // ✅ FASE 2: Health Check System Functions
@@ -986,13 +1107,15 @@ export class BaileysStartupService extends ChannelStartupService {
         ownerJid: ownerJid,
       });
 
-      // Trigger force restart se non è già in corso un auto-restart
-      if (!this.isAutoRestarting) {
-        this.logger.warn(`[HealthCheck] Instance ${this.instance.name} - Triggering force restart...`);
+      // ✅ FIX DEFINITIVO: Trigger force restart se non è già in corso (usa isRestartInProgress)
+      if (!this.isRestartInProgress) {
+        this.logger.warn(
+          `[HealthCheck] Instance ${this.instance.name} - 🔨 Triggering force restart (no restart in progress)...`,
+        );
         await this.forceRestart('Health check detected stuck in reconnecting state');
       } else {
         this.logger.info(
-          `[HealthCheck] Instance ${this.instance.name} - Auto-restart already in progress, skipping force restart`,
+          `[HealthCheck] Instance ${this.instance.name} - ⏸️ Restart already in progress, skipping force restart`,
         );
       }
       return;
@@ -1085,20 +1208,25 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   /**
-   * Force restart dell'istanza quando rilevato un problema
+   * ✅ FIX DEFINITIVO: Force restart completamente riscritto con stesso fix di autoRestart()
+   * Risolve lo stesso deadlock applicando la stessa soluzione
    */
   private async forceRestart(reason: string) {
+    const restartStartTime = Date.now();
+
     try {
-      // ✅ FIX #1: Previeni race condition - skip se già in restart
-      if (this.isAutoRestarting) {
-        this.logger.warn(`[ForceRestart] Instance ${this.instance.name} - Already restarting, skipping duplicate call`);
+      // ✅ FIX: Previeni race condition - usa isRestartInProgress invece di isAutoRestarting
+      if (this.isRestartInProgress) {
+        this.logger.warn(
+          `[ForceRestart] Instance ${this.instance.name} - Restart already in progress, skipping duplicate call`,
+        );
         return;
       }
 
-      // ✅ FIX #2: Check max attempts
+      // ✅ Check max attempts
       if (this.forceRestartAttempts >= this.MAX_FORCE_RESTART_ATTEMPTS) {
         this.logger.error(
-          `[ForceRestart] Instance ${this.instance.name} - Max attempts reached (${this.forceRestartAttempts}/${this.MAX_FORCE_RESTART_ATTEMPTS}). Giving up. Manual intervention required.`,
+          `[ForceRestart] Instance ${this.instance.name} - ❌ Max attempts reached (${this.forceRestartAttempts}/${this.MAX_FORCE_RESTART_ATTEMPTS}). Manual intervention required.`,
         );
 
         this.sendDataWebhook(Events.INSTANCE_STUCK, {
@@ -1113,7 +1241,7 @@ export class BaileysStartupService extends ChannelStartupService {
         return;
       }
 
-      // ✅ FIX #2: Rate limiting - minimo 5s tra force restart
+      // ✅ Rate limiting - minimo 5s tra force restart
       const now = Date.now();
       const timeSinceLastRestart = now - this.lastForceRestartTime;
 
@@ -1128,74 +1256,112 @@ export class BaileysStartupService extends ChannelStartupService {
       this.forceRestartAttempts++;
 
       this.logger.warn(
-        `[ForceRestart] Instance ${this.instance.name} - Forcing restart (attempt ${this.forceRestartAttempts}/${this.MAX_FORCE_RESTART_ATTEMPTS}). Reason: ${reason}`,
+        `[ForceRestart] Instance ${this.instance.name} - 🔨 FORCING RESTART (attempt ${this.forceRestartAttempts}/${this.MAX_FORCE_RESTART_ATTEMPTS}) | Reason: ${reason} | Timestamp: ${new Date().toISOString()}`,
       );
 
-      // ✅ FIX #1: Cancella auto-restart timer se attivo (previene conflitto)
-      if (this.connectingTimer) {
-        clearTimeout(this.connectingTimer);
-        this.connectingTimer = null;
+      // Lock per prevenire chiamate duplicate
+      this.isRestartInProgress = true;
+      this.isAutoRestartTriggered = true;
+
+      // ✅ FIX: Usa cleanupClient() per cleanup completo
+      this.logger.info(`[ForceRestart] Instance ${this.instance.name} - 🧹 Starting complete client cleanup...`);
+      this.cleanupClient('force-restart');
+
+      // Aspetta che diventi 'close'
+      if (this.client) {
+        this.logger.info(
+          `[ForceRestart] Instance ${this.instance.name} - ⏳ Waiting for state to become 'close' (max 5s)...`,
+        );
+
+        const closed = await this.waitForState('close', 5000);
+        if (!closed) {
+          this.logger.error(
+            `[ForceRestart] Instance ${this.instance.name} - ❌ Timeout waiting for 'close'. Current state: ${this.stateConnection.state}`,
+          );
+          this.isRestartInProgress = false;
+          return;
+        }
       }
 
-      // ✅ FIX #1: Cancella safety timeout precedente se esiste
+      this.logger.info(
+        `[ForceRestart] Instance ${this.instance.name} - ✅ State is now 'close'. Proceeding with reconnection...`,
+      );
+
+      // ✅ FIX: Ricarica proxy configuration
+      this.logger.info(`[ForceRestart] Instance ${this.instance.name} - 🔄 Reloading proxy configuration...`);
+      await this.loadProxy();
+
+      // ✅ FIX CRITICO: Reset isAutoRestarting PRIMA di creare nuovo client
+      this.logger.info(
+        `[ForceRestart] Instance ${this.instance.name} - 🔓 Resetting isAutoRestarting flag to allow timer activation`,
+      );
+      this.isAutoRestarting = false; // ← FIX DEADLOCK
+
+      // ✅ FIX: Chiamata diretta a createClient
+      this.logger.info(`[ForceRestart] Instance ${this.instance.name} - 🔌 Creating new client (direct call)...`);
+      await this.createClient(this.phoneNumber);
+
+      const restartDuration = Date.now() - restartStartTime;
+      this.logger.info(
+        `[ForceRestart] Instance ${this.instance.name} - ✅ Client creation completed in ${restartDuration}ms`,
+      );
+
+      // Reset lock
+      this.isRestartInProgress = false;
+
+      // ✅ FIX: Safety timeout migliorato (identico a autoRestart)
       if (this.safetyTimeout) {
         clearTimeout(this.safetyTimeout);
         this.safetyTimeout = null;
       }
 
-      // Marca come auto-restarting per evitare conflitti
-      this.isAutoRestarting = true;
-      this.isAutoRestartTriggered = true; // ✅ FIX #15: Consistenza flag
-
-      // Chiudi completamente il client
-      if (this.client) {
-        this.logger.info(`[ForceRestart] Instance ${this.instance.name} - Closing client...`);
-        this.client?.ws?.close();
-        this.client?.end(new Error(`Force restart: ${reason}`));
-
-        // Aspetta che diventi 'close'
-        const closed = await this.waitForState('close', 5000);
-        if (!closed) {
-          this.logger.error(
-            `[ForceRestart] Instance ${this.instance.name} - Timeout waiting for 'close' state. Current state: ${this.stateConnection.state}`,
-          );
-          this.isAutoRestarting = false;
-          return;
-        }
-      }
-
-      // Ricarica proxy e riconnetti
-      this.logger.info(`[ForceRestart] Instance ${this.instance.name} - Reloading proxy and reconnecting...`);
-      await this.loadProxy();
-      await this.connectToWhatsapp(this.phoneNumber);
-
-      this.logger.info(`[ForceRestart] Instance ${this.instance.name} - Restart completed`);
-
-      // ✅ FIX #1: Salva safety timeout per poterlo cancellare
-      // Safety timeout: reset flag se non raggiunge 'open' entro 30s
       this.safetyTimeout = setTimeout(() => {
-        if (this.isAutoRestarting && this.stateConnection.state !== 'open') {
-          this.logger.warn(
-            `[ForceRestart] Instance ${this.instance.name} - Safety timeout: still in '${this.stateConnection.state}' after 30s, resetting isAutoRestarting flag to allow reconnection attempts`,
-          );
-          this.isAutoRestarting = false;
+        const currentState = this.stateConnection.state;
 
-          // Webhook per monitoraggio esterno
+        if (currentState !== 'open') {
+          this.logger.error(
+            `[ForceRestart] Instance ${this.instance.name} - ⏰ Safety timeout: still in '${currentState}' after 30s`,
+          );
+
+          // ✅ NUOVO: Triggera force close se in connecting
+          if (currentState === 'connecting') {
+            this.logger.warn(
+              `[ForceRestart] Instance ${this.instance.name} - 🔨 Forcing close to trigger new reconnection attempt...`,
+            );
+
+            if (this.client) {
+              this.client.ws?.close();
+              this.client.end(new Error('Safety timeout - forcing close to retry'));
+            }
+          }
+
+          // Reset flag
+          this.isAutoRestarting = false;
+          this.isAutoRestartTriggered = false;
+          this.isRestartInProgress = false;
+
           this.sendDataWebhook(Events.INSTANCE_STUCK, {
             instance: this.instance.name,
-            state: this.stateConnection.state,
-            action: 'reset_isAutoRestarting_flag',
+            state: currentState,
+            action: 'safety_timeout_triggered',
             reason: 'force_restart_timeout',
             timeout: 30000,
+            nextAction: currentState === 'connecting' ? 'forced_close' : 'flag_reset',
           });
         }
-        this.safetyTimeout = null; // ✅ Cleanup
+        this.safetyTimeout = null;
       }, 30000);
     } catch (error) {
-      this.logger.error(`[ForceRestart] Instance ${this.instance.name} - Failed: ${error.toString()}`);
-      this.isAutoRestarting = false;
+      this.logger.error(
+        `[ForceRestart] Instance ${this.instance.name} - ❌ Exception: ${error.toString()}\nStack: ${error.stack}`,
+      );
 
-      // ✅ FIX #1: Cleanup safety timeout anche su exception
+      // Reset flag su errore
+      this.isAutoRestarting = false;
+      this.isAutoRestartTriggered = false;
+      this.isRestartInProgress = false;
+
+      // Cleanup safety timeout
       if (this.safetyTimeout) {
         clearTimeout(this.safetyTimeout);
         this.safetyTimeout = null;
