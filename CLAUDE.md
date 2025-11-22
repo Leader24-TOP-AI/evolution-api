@@ -214,6 +214,80 @@ Currently, the project has minimal formal testing infrastructure:
 - **Integration tests** for API endpoints
 - **Manual testing** for WhatsApp connection flows
 
+## Standard Workflow After Code Changes
+
+**IMPORTANTE:** Dopo ogni modifica al codice backend, seguire SEMPRE questa sequenza:
+
+### 1. Build del Backend
+```bash
+npm run build
+```
+- Compila TypeScript → JavaScript
+- Verifica errori di compilazione
+- Output in `dist/` directory
+- **OBBLIGATORIO** prima del restart
+
+### 2. Riavvio Server PM2
+```bash
+pm2 restart evolution-api
+```
+- Riavvia il processo Evolution API
+- Carica il codice compilato aggiornato
+- Mantiene il processo in background
+- **Necessario** per applicare le modifiche
+
+### 3. Push su GitHub (Solo Modifiche)
+```bash
+git add <file-modificati>
+git commit -m "descrizione modifiche"
+git push origin main
+```
+- **NON fare** `git add .` (troppo generico)
+- Aggiungere SOLO file effettivamente modificati
+- Commit message descrittivo
+- Push su branch `main`
+
+**Sequenza completa esempio:**
+```bash
+# 1. Build
+cd /root/evolution-api
+npm run build
+
+# 2. Restart
+pm2 restart evolution-api
+
+# 3. Verifica
+pm2 logs evolution-api --lines 20
+
+# 4. Push
+git add src/api/controllers/example.controller.ts
+git commit -m "feat: add new feature to example controller"
+git push origin main
+```
+
+### Frontend (se modificato)
+Se hai modificato file in `evolution-manager-v2/`:
+```bash
+# 1. Build frontend
+cd evolution-manager-v2
+npm run build
+
+# 2. Deploy in manager/dist
+cd ..
+rm -rf manager/dist
+cp -r evolution-manager-v2/dist manager/dist
+
+# 3. Restart backend (serve i file statici)
+pm2 restart evolution-api
+
+# 4. Push (include submodule + dist)
+git add evolution-manager-v2 manager/dist
+git commit -m "feat: frontend changes"
+git push origin main
+```
+
+---
+
 ## Deployment Considerations
 
 - Docker support with `Dockerfile` and `docker-compose.yaml`
