@@ -21,8 +21,52 @@ export class LogsController {
   private readonly ERR_LOG = 'evolution-api-error.log';
 
   /**
+   * Helper: Legge log da file con fallback ai file rotati
+   * ✅ FIX: Se file corrente vuoto (dopo logrotate), cerca nei file rotati
+   */
+  private async readLogsWithFallback(logFileName: string, lines: number): Promise<string[]> {
+    const primaryPath = path.join(this.PM2_LOGS_PATH, logFileName);
+
+    try {
+      // Prova file corrente
+      const { stdout } = await execAsync(`tail -n ${lines} "${primaryPath}"`);
+      const logs = stdout.split('\n').filter(Boolean);
+
+      // Se file corrente ha log, ritorna
+      if (logs.length > 0) {
+        return logs;
+      }
+
+      // ✅ File corrente vuoto - cerca nei file rotati
+      console.warn(`[Logs] File corrente vuoto: ${logFileName}. Cercando nei file rotati...`);
+
+      // Cerca file rotati (formato: evolution-api-out.log-YYYYMMDD)
+      const { stdout: lsStdout } = await execAsync(
+        `ls -t "${this.PM2_LOGS_PATH}"/${logFileName.replace('.log', '.log-')}* 2>/dev/null || echo ""`,
+      );
+      const rotatedFiles = lsStdout.split('\n').filter(Boolean);
+
+      if (rotatedFiles.length === 0) {
+        console.warn(`[Logs] Nessun file rotato trovato per ${logFileName}`);
+        return [];
+      }
+
+      // Prendi il file rotato più recente (primo nell'output ls -t)
+      const latestRotatedFile = rotatedFiles[0];
+      console.log(`[Logs] Leggendo da file rotato: ${latestRotatedFile}`);
+
+      const { stdout: rotatedStdout } = await execAsync(`tail -n ${lines} "${latestRotatedFile}"`);
+      return rotatedStdout.split('\n').filter(Boolean);
+    } catch (error) {
+      console.warn(`[Logs] Error reading ${logFileName}:`, error.message);
+      return [];
+    }
+  }
+
+  /**
    * GET /logs/snapshot
    * Ottieni uno snapshot degli ultimi N log
+   * ✅ FIX: Supporta fallback ai file rotati se file corrente vuoto
    */
   public async getSnapshot(req: Request, res: Response) {
     try {
@@ -31,32 +75,18 @@ export class LogsController {
       const instance = req.query.instance as string; // Filtra per istanza specifica
       const search = req.query.search as string; // Ricerca testo
 
-      const outLogPath = path.join(this.PM2_LOGS_PATH, this.OUT_LOG);
-      const errLogPath = path.join(this.PM2_LOGS_PATH, this.ERR_LOG);
-
       let logs: string[] = [];
 
-      // Leggi stdout logs
+      // ✅ Leggi stdout logs con fallback
       if (level === 'all' || !level || level !== 'error') {
-        try {
-          const { stdout } = await execAsync(`tail -n ${lines} "${outLogPath}"`);
-          logs = stdout.split('\n').filter(Boolean);
-        } catch (error) {
-          // File potrebbe non esistere ancora
-          console.warn('Error reading stdout log:', error.message);
-        }
+        const outLogs = await this.readLogsWithFallback(this.OUT_LOG, lines);
+        logs = [...logs, ...outLogs];
       }
 
-      // Leggi stderr logs solo se richiesto
+      // ✅ Leggi stderr logs con fallback
       if (level === 'error' || level === 'all' || !level) {
-        try {
-          const { stdout: errStdout } = await execAsync(`tail -n ${lines} "${errLogPath}"`);
-          const errLogs = errStdout.split('\n').filter(Boolean);
-          logs = [...logs, ...errLogs];
-        } catch (error) {
-          // File potrebbe non esistere ancora
-          console.warn('Error reading stderr log:', error.message);
-        }
+        const errLogs = await this.readLogsWithFallback(this.ERR_LOG, lines);
+        logs = [...logs, ...errLogs];
       }
 
       // Parse e filtra log
