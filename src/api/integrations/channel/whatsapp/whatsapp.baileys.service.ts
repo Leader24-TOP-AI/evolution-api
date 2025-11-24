@@ -877,10 +877,14 @@ export class BaileysStartupService extends ChannelStartupService {
         `[Auto-Restart] Instance ${this.instance.name} - ❌ Exception: ${error.toString()}\nStack: ${error.stack}`,
       );
 
-      // Reset tutti i flag su errore
+      // Reset flag su errore (preserva wasOpenBeforeReconnect per future riconnessioni)
       this.isAutoRestarting = false;
       this.isAutoRestartTriggered = false;
       this.isRestartInProgress = false;
+
+      // ✅ FIX BUG #4: wasOpenBeforeReconnect NON viene resettato qui
+      // Preservato per permettere recovery automatico su prossima riconnessione
+      // this.wasOpenBeforeReconnect = this.wasOpenBeforeReconnect;  // Mantiene valore
 
       // Cleanup safety timeout
       if (this.safetyTimeout) {
@@ -1050,11 +1054,13 @@ export class BaileysStartupService extends ChannelStartupService {
 
       this.isAutoRestarting = false;
       this.isAutoRestartTriggered = false;
-      this.wasOpenBeforeReconnect = false;
+      // ✅ FIX BUG #3: NON resettare wasOpenBeforeReconnect qui
+      // Preservarlo permette recovery automatico su prossima riconnessione
+      // this.wasOpenBeforeReconnect = false;  // ← RIMOSSO reset inappropriato
       this.autoRestartAttempts = 0;
 
       this.logger.warn(
-        `[HealthCheck] Instance ${this.instance.name} - Flags reset. Will attempt reconnection on next 'close' event.`,
+        `[HealthCheck] Instance ${this.instance.name} - Flags reset (preserving wasOpenBeforeReconnect for recovery). Will attempt reconnection on next 'close' event.`,
       );
 
       return;
@@ -1335,10 +1341,14 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          // Reset flag
+          // Reset flag per permettere nuovi tentativi
           this.isAutoRestarting = false;
           this.isAutoRestartTriggered = false;
           this.isRestartInProgress = false;
+
+          // ✅ FIX BUG #1: Preserva wasOpenBeforeReconnect anche dopo safety timeout
+          // NON resettare questo flag - è critico per permettere timer auto-restart su future riconnessioni
+          // this.wasOpenBeforeReconnect = this.wasOpenBeforeReconnect;  // Mantiene valore
 
           this.sendDataWebhook(Events.INSTANCE_STUCK, {
             instance: this.instance.name,
@@ -1356,10 +1366,14 @@ export class BaileysStartupService extends ChannelStartupService {
         `[ForceRestart] Instance ${this.instance.name} - ❌ Exception: ${error.toString()}\nStack: ${error.stack}`,
       );
 
-      // Reset flag su errore
+      // Reset flag su errore (preserva wasOpenBeforeReconnect per future riconnessioni)
       this.isAutoRestarting = false;
       this.isAutoRestartTriggered = false;
       this.isRestartInProgress = false;
+
+      // ✅ FIX BUG #2: wasOpenBeforeReconnect NON viene resettato qui
+      // Preservato per permettere recovery automatico su prossima riconnessione
+      // this.wasOpenBeforeReconnect = this.wasOpenBeforeReconnect;  // Mantiene valore
 
       // Cleanup safety timeout
       if (this.safetyTimeout) {
