@@ -292,6 +292,13 @@ export class BaileysStartupService extends ChannelStartupService {
   // ✅ FIX #11: Log state tracking
   private lastLoggedHealthState: { state: string; age: number } | null = null;
 
+  // ✅ EXPONENTIAL BACKOFF - Sostituisce limiti rigidi per evitare blocco permanente
+  private currentRestartDelay = 5000; // Delay attuale (inizia 5s)
+  private readonly MIN_RESTART_DELAY = 5000; // Minimo 5s
+  private readonly MAX_RESTART_DELAY = 30000; // Massimo 30 secondi (ragionevole per UX cliente)
+  private lastSuccessfulConnection = 0; // Timestamp ultima connessione OK
+  private readonly STABLE_CONNECTION_TIME = 120000; // 2 min per considerare stabile e reset delay
+
   public phoneNumber: string;
 
   public get connectionStatus() {
@@ -596,6 +603,13 @@ export class BaileysStartupService extends ChannelStartupService {
       this.forceRestartAttempts = 0;
       this.lastForceRestartTime = 0;
 
+      // ✅ BACKOFF: Reset delay e registra timestamp successo
+      this.currentRestartDelay = this.MIN_RESTART_DELAY;
+      this.lastSuccessfulConnection = Date.now();
+      this.logger.info(
+        `[Backoff] Instance ${this.instance.name} - Connection successful, delay reset to ${this.MIN_RESTART_DELAY}ms`,
+      );
+
       // ✅ FASE 2: Update timestamp e avvia health check
       this.lastStateChangeTimestamp = Date.now();
       this.startHealthCheck();
@@ -672,29 +686,31 @@ export class BaileysStartupService extends ChannelStartupService {
         `[Connection] Instance ${this.instance.name} - State: connecting | Flags: wasOpenBeforeReconnect=${this.wasOpenBeforeReconnect}, isAutoRestarting=${this.isAutoRestarting}, isRestartInProgress=${this.isRestartInProgress}, attempts=${this.autoRestartAttempts}/${this.maxAutoRestartAttempts}`,
       );
 
-      // ✅ FIX DEFINITIVO: Usa isRestartInProgress invece di isAutoRestarting
-      // Questo permette al timer di avviarsi anche durante auto-restart
-      // perché isAutoRestarting viene resettato PRIMA di createClient()
+      // ✅ BACKOFF: Usa isRestartInProgress per prevenire duplicati
+      // RIMOSSO limite autoRestartAttempts - ora usa exponential backoff infinito
       if (
         this.wasOpenBeforeReconnect &&
-        !this.isRestartInProgress &&
-        this.autoRestartAttempts < this.maxAutoRestartAttempts
+        !this.isRestartInProgress
+        // ✅ RIMOSSO: this.autoRestartAttempts < this.maxAutoRestartAttempts
+        // Non c'è più limite - usiamo exponential backoff per evitare blocco permanente
       ) {
-        this.logger.warn(
-          `[Auto-Restart] Instance ${this.instance.name} - Detected stuck in 'connecting' state (was 'open' before reconnect). Auto-restart will trigger in ${this.autoRestartTimerMs / 1000}s if still connecting...`,
-        );
-
         // Cancella timer precedente se esiste
         if (this.connectingTimer) {
           clearTimeout(this.connectingTimer);
         }
 
-        // Avvia timer (ottimizzato: 5 secondi invece di 15)
+        // ✅ BACKOFF: Usa delay dinamico invece di fisso
+        const restartDelay = this.getNextRestartDelay();
+        this.logger.warn(
+          `[Auto-Restart] Instance ${this.instance.name} - Detected stuck in 'connecting'. Will retry in ${restartDelay}ms (attempt ${this.autoRestartAttempts + 1}, no limit)...`,
+        );
+
+        // Avvia timer con delay dinamico (backoff)
         this.connectingTimer = setTimeout(() => {
           // Verifica che siamo ancora in stato 'connecting'
           if (this.stateConnection.state === 'connecting') {
             this.logger.warn(
-              `[Auto-Restart] Instance ${this.instance.name} - Still in 'connecting' after ${this.autoRestartTimerMs / 1000}s. Triggering auto-restart (attempt ${this.autoRestartAttempts + 1}/${this.maxAutoRestartAttempts})...`,
+              `[Auto-Restart] Instance ${this.instance.name} - Still in 'connecting' after ${restartDelay}ms. Triggering auto-restart...`,
             );
             this.autoRestart();
           } else {
@@ -702,9 +718,9 @@ export class BaileysStartupService extends ChannelStartupService {
               `[Auto-Restart] Instance ${this.instance.name} - Timer expired but state changed to '${this.stateConnection.state}'. Auto-restart canceled.`,
             );
           }
-        }, this.autoRestartTimerMs);
+        }, restartDelay);
       } else {
-        // ✅ FIX DEFINITIVO: Log migliorato con spiegazione dettagliata
+        // Log spiegazione dettagliata
         if (!this.wasOpenBeforeReconnect) {
           this.logger.verbose(
             `[Auto-Restart] Instance ${this.instance.name} - ⏸️ Timer NOT started: wasOpenBeforeReconnect is false (first connection or definitive close)`,
@@ -713,14 +729,10 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(
             `[Auto-Restart] Instance ${this.instance.name} - ⏸️ Timer NOT started: restart operation in progress (isRestartInProgress=true)`,
           );
-        } else if (this.autoRestartAttempts >= this.maxAutoRestartAttempts) {
-          this.logger.error(
-            `[Auto-Restart] Instance ${this.instance.name} - ❌ Timer NOT started: max attempts reached (${this.autoRestartAttempts}/${this.maxAutoRestartAttempts}). Instance stuck!`,
-          );
         } else {
           // Caso non previsto - log per debug
           this.logger.warn(
-            `[Auto-Restart] Instance ${this.instance.name} - ⚠️ Timer NOT started: unexpected condition. Flags: wasOpenBeforeReconnect=${this.wasOpenBeforeReconnect}, isRestartInProgress=${this.isRestartInProgress}, attempts=${this.autoRestartAttempts}/${this.maxAutoRestartAttempts}`,
+            `[Auto-Restart] Instance ${this.instance.name} - ⚠️ Timer NOT started: unexpected condition. Flags: wasOpenBeforeReconnect=${this.wasOpenBeforeReconnect}, isRestartInProgress=${this.isRestartInProgress}`,
           );
         }
       }
@@ -916,6 +928,32 @@ export class BaileysStartupService extends ChannelStartupService {
 
       checkState();
     });
+  }
+
+  /**
+   * ✅ EXPONENTIAL BACKOFF: Calcola il prossimo delay per restart
+   * Backoff: 5s → 10s → 20s → 30s (cap)
+   * Si resetta quando la connessione è stabile per 2 minuti
+   */
+  private getNextRestartDelay(): number {
+    // Se connessione era stabile per 2+ minuti, reset delay
+    if (this.lastSuccessfulConnection > 0 && Date.now() - this.lastSuccessfulConnection > this.STABLE_CONNECTION_TIME) {
+      this.currentRestartDelay = this.MIN_RESTART_DELAY;
+      this.logger.info(
+        `[Backoff] Instance ${this.instance.name} - Connection was stable, resetting delay to ${this.MIN_RESTART_DELAY}ms`,
+      );
+    }
+
+    const delay = this.currentRestartDelay;
+
+    // Aumenta per prossimo tentativo (cap a MAX 30s)
+    this.currentRestartDelay = Math.min(this.currentRestartDelay * 2, this.MAX_RESTART_DELAY);
+
+    this.logger.info(
+      `[Backoff] Instance ${this.instance.name} - Current delay: ${delay}ms, next will be: ${this.currentRestartDelay}ms`,
+    );
+
+    return delay;
   }
 
   /**
@@ -1161,13 +1199,18 @@ export class BaileysStartupService extends ChannelStartupService {
       return true; // Nessun proxy configurato
     }
 
-    // ✅ FIX #8: Verifica cache (evita chiamate ripetute a api.ipify.org)
+    // ✅ CACHE ASIMMETRICA: fallimenti scadono più velocemente per riprovare dopo cambio IP
     const proxyKey = `${this.localProxy.host}:${this.localProxy.port}`;
     const cached = this.proxyTestCache.get(proxyKey);
 
-    if (cached && Date.now() - cached.timestamp < this.PROXY_TEST_CACHE_TTL) {
+    // TTL diversi: 5 min per successi, 30s per fallimenti
+    const cacheTTL = cached?.result
+      ? 300000 // 5 min per successi (proxy stabile)
+      : 30000; // 30s per fallimenti (riprova veloce dopo cambio IP)
+
+    if (cached && Date.now() - cached.timestamp < cacheTTL) {
       this.logger.verbose(
-        `[HealthCheck] Instance ${this.instance.name} - Using cached proxy test result: ${cached.result}`,
+        `[HealthCheck] Instance ${this.instance.name} - Using cached proxy result: ${cached.result} (TTL: ${cacheTTL / 1000}s)`,
       );
       return cached.result;
     }
@@ -1229,40 +1272,11 @@ export class BaileysStartupService extends ChannelStartupService {
         return;
       }
 
-      // ✅ Check max attempts
-      if (this.forceRestartAttempts >= this.MAX_FORCE_RESTART_ATTEMPTS) {
-        this.logger.error(
-          `[ForceRestart] Instance ${this.instance.name} - ❌ Max attempts reached (${this.forceRestartAttempts}/${this.MAX_FORCE_RESTART_ATTEMPTS}). Manual intervention required.`,
-        );
-
-        this.sendDataWebhook(Events.INSTANCE_STUCK, {
-          instance: this.instance.name,
-          state: this.stateConnection.state,
-          action: 'max_force_restart_attempts_reached',
-          reason: 'instance_unrecoverable',
-          attempts: this.forceRestartAttempts,
-          maxAttempts: this.MAX_FORCE_RESTART_ATTEMPTS,
-        });
-
-        return;
-      }
-
-      // ✅ Rate limiting - minimo 5s tra force restart
-      const now = Date.now();
-      const timeSinceLastRestart = now - this.lastForceRestartTime;
-
-      if (timeSinceLastRestart < this.MIN_FORCE_RESTART_INTERVAL) {
-        this.logger.warn(
-          `[ForceRestart] Instance ${this.instance.name} - Too soon since last restart (${timeSinceLastRestart}ms < ${this.MIN_FORCE_RESTART_INTERVAL}ms). Skipping.`,
-        );
-        return;
-      }
-
-      this.lastForceRestartTime = now;
+      // ✅ BACKOFF: RIMOSSO limite rigido - usa exponential backoff invece
+      // Il backoff in getNextRestartDelay() gestisce automaticamente i retry
       this.forceRestartAttempts++;
-
-      this.logger.warn(
-        `[ForceRestart] Instance ${this.instance.name} - 🔨 FORCING RESTART (attempt ${this.forceRestartAttempts}/${this.MAX_FORCE_RESTART_ATTEMPTS}) | Reason: ${reason} | Timestamp: ${new Date().toISOString()}`,
+      this.logger.info(
+        `[ForceRestart] Instance ${this.instance.name} - Attempt ${this.forceRestartAttempts} (no limit, using exponential backoff) | Reason: ${reason}`,
       );
 
       // Lock per prevenire chiamate duplicate
@@ -1296,6 +1310,15 @@ export class BaileysStartupService extends ChannelStartupService {
       // ✅ FIX: Ricarica proxy configuration
       this.logger.info(`[ForceRestart] Instance ${this.instance.name} - 🔄 Reloading proxy configuration...`);
       await this.loadProxy();
+
+      // ✅ BACKOFF: Attendi prima di ricreare client (solo se non è primo tentativo)
+      const backoffDelay = this.getNextRestartDelay();
+      if (backoffDelay > this.MIN_RESTART_DELAY) {
+        this.logger.info(
+          `[ForceRestart] Instance ${this.instance.name} - ⏳ Waiting ${backoffDelay}ms before reconnection (backoff)...`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, backoffDelay - this.MIN_RESTART_DELAY));
+      }
 
       // ✅ FIX CRITICO: Reset isAutoRestarting PRIMA di creare nuovo client
       this.logger.info(
