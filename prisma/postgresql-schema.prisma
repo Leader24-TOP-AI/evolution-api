@@ -112,6 +112,7 @@ model Instance {
   N8nSetting              N8nSetting[]
   Evoai                   Evoai[]
   EvoaiSetting            EvoaiSetting?
+  ProxyStatus             ProxyStatus?
 }
 
 model Session {
@@ -760,4 +761,39 @@ model EvoaiSetting {
   evoaiIdFallback String?   @db.VarChar(100)
   Instance        Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId      String    @unique
+}
+
+model ProxyStatus {
+  id             String         @id @default(cuid())
+  instanceId     String         @unique
+  currentIp      String?        @db.VarChar(50)
+  city           String?        @db.VarChar(100)
+  country        String?        @db.VarChar(100)
+  countryCode    String?        @db.VarChar(10)
+  connectedSince DateTime?      @db.Timestamp
+  totalIpChanges Int            @default(0) @db.Integer
+  lastIpChange   DateTime?      @db.Timestamp
+  lastCheck      DateTime?      @db.Timestamp
+  createdAt      DateTime       @default(now()) @db.Timestamp
+  updatedAt      DateTime       @updatedAt @db.Timestamp
+  Instance       Instance       @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  ProxyHistory   ProxyHistory[]
+
+  @@index([instanceId])
+}
+
+model ProxyHistory {
+  id            String      @id @default(cuid())
+  proxyStatusId String
+  ip            String      @db.VarChar(50)
+  city          String?     @db.VarChar(100)
+  country       String?     @db.VarChar(100)
+  countryCode   String?     @db.VarChar(10)
+  connectedAt   DateTime    @db.Timestamp
+  disconnectedAt DateTime?  @db.Timestamp
+  createdAt     DateTime    @default(now()) @db.Timestamp
+  ProxyStatus   ProxyStatus @relation(fields: [proxyStatusId], references: [id], onDelete: Cascade)
+
+  @@index([proxyStatusId])
+  @@index([createdAt])
 }

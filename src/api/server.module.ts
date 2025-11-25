@@ -10,6 +10,7 @@ import { GroupController } from './controllers/group.controller';
 import { InstanceController } from './controllers/instance.controller';
 import { LabelController } from './controllers/label.controller';
 import { ProxyController } from './controllers/proxy.controller';
+import { ProxyMonitorController } from './controllers/proxy-monitor.controller';
 import { SendMessageController } from './controllers/sendMessage.controller';
 import { SettingsController } from './controllers/settings.controller';
 import { TemplateController } from './controllers/template.controller';
@@ -42,6 +43,7 @@ import { PrismaRepository } from './repository/repository.service';
 import { CacheService } from './services/cache.service';
 import { WAMonitoringService } from './services/monitor.service';
 import { ProxyService } from './services/proxy.service';
+import { ProxyMonitorService } from './services/proxy-monitor.service';
 import { SettingsService } from './services/settings.service';
 import { TemplateService } from './services/template.service';
 
@@ -80,6 +82,9 @@ export const templateController = new TemplateController(templateService);
 
 const proxyService = new ProxyService(waMonitor);
 export const proxyController = new ProxyController(proxyService, waMonitor);
+
+export const proxyMonitorService = new ProxyMonitorService(waMonitor, prismaRepository);
+export const proxyMonitorController = new ProxyMonitorController(proxyMonitorService);
 
 const chatwootService = new ChatwootService(waMonitor, configService, prismaRepository, chatwootCache);
 export const chatwootController = new ChatwootController(chatwootService, configService, prismaRepository);

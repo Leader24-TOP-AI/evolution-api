@@ -21,6 +21,7 @@ import { InstanceRouter } from './instance.router';
 import { LabelRouter } from './label.router';
 import { LogsRouter } from './logs.router';
 import { ProxyRouter } from './proxy.router';
+import { ProxyMonitorRouter } from './proxy-monitor.router';
 import { MessageRouter } from './sendMessage.router';
 import { SettingsRouter } from './settings.router';
 import { TemplateRouter } from './template.router';
@@ -219,6 +220,7 @@ router
   .use('/template', new TemplateRouter(configService, ...guards).router)
   .use('/settings', new SettingsRouter(...guards).router)
   .use('/proxy', new ProxyRouter(...guards).router)
+  .use('/proxy-monitor', new ProxyMonitorRouter(...guards).router)
   .use('/label', new LabelRouter(...guards).router)
   .use('/logs', new LogsRouter().router)
   .use('', new ChannelRouter(configService, ...guards).router)
