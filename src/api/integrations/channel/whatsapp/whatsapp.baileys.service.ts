@@ -828,6 +828,11 @@ export class BaileysStartupService extends ChannelStartupService {
       );
       await this.createClient(this.phoneNumber);
 
+      // ✅ FIX #2: Verifica che il client sia stato creato correttamente
+      if (!this.client) {
+        throw new Error('createClient() completed but client is null - cannot proceed');
+      }
+
       const restartDuration = Date.now() - restartStartTime;
       this.logger.info(
         `[Auto-Restart] Instance ${this.instance.name} - ✅ Client creation completed in ${restartDuration}ms. Waiting for connection state update...`,
@@ -850,37 +855,55 @@ export class BaileysStartupService extends ChannelStartupService {
             `[Auto-Restart] Instance ${this.instance.name} - ⏰ Safety timeout: still in '${currentState}' after 30s`,
           );
 
-          // ✅ NUOVO: Invece di solo resettare flag, triggera FORCE CLOSE
-          // per forzare un nuovo evento 'close' che riattivi la riconnessione
+          // ✅ FIX #6: Gestione corretta del safety timeout per evitare loop infinito
           if (currentState === 'connecting') {
             this.logger.warn(
-              `[Auto-Restart] Instance ${this.instance.name} - 🔨 Forcing close to trigger new reconnection attempt...`,
+              `[Auto-Restart] Instance ${this.instance.name} - 🔨 Safety timeout: forcing close and will retry with autoRestart()`,
             );
+
+            // ✅ FIX #6: Setta flag PRIMA del close per prevenire reconnect automatico nel close handler
+            this.isRestartInProgress = true;
 
             // Forza close del client
             if (this.client) {
               this.client.ws?.close();
               this.client.end(new Error('Safety timeout - forcing close to retry'));
             }
+
+            // ✅ FIX #6: Aspetta che il close si propaghi, poi riprova con autoRestart
+            setTimeout(() => {
+              this.isRestartInProgress = false;
+              this.isAutoRestarting = false;
+              this.isAutoRestartTriggered = false;
+              this.logger.info(
+                `[Auto-Restart] Instance ${this.instance.name} - 🔄 Retrying connection via autoRestart() after safety timeout...`,
+              );
+              this.autoRestart();
+            }, 2000);
+
+            this.sendDataWebhook(Events.INSTANCE_STUCK, {
+              instance: this.instance.name,
+              state: currentState,
+              action: 'safety_timeout_triggered',
+              reason: 'auto_restart_timeout',
+              timeout: 30000,
+              nextAction: 'controlled_retry_via_autoRestart',
+            });
+          } else {
+            // Stato non è 'connecting' - solo reset flag
+            this.isAutoRestarting = false;
+            this.isAutoRestartTriggered = false;
+            this.isRestartInProgress = false;
+
+            this.sendDataWebhook(Events.INSTANCE_STUCK, {
+              instance: this.instance.name,
+              state: currentState,
+              action: 'safety_timeout_triggered',
+              reason: 'auto_restart_timeout',
+              timeout: 30000,
+              nextAction: 'flag_reset_only',
+            });
           }
-
-          // Reset flag per permettere nuovi tentativi
-          this.isAutoRestarting = false;
-          this.isAutoRestartTriggered = false;
-          this.isRestartInProgress = false;
-
-          // ✅ NUOVO: Preserva wasOpenBeforeReconnect anche dopo safety timeout
-          // (il vecchio codice lo perdeva, impedendo futuri auto-restart)
-          // this.wasOpenBeforeReconnect = this.wasOpenBeforeReconnect;  // Mantiene valore
-
-          this.sendDataWebhook(Events.INSTANCE_STUCK, {
-            instance: this.instance.name,
-            state: currentState,
-            action: 'safety_timeout_triggered',
-            reason: 'auto_restart_timeout',
-            timeout: 30000,
-            nextAction: currentState === 'connecting' ? 'forced_close' : 'flag_reset',
-          });
         }
         this.safetyTimeout = null;
       }, 30000);
@@ -902,6 +925,15 @@ export class BaileysStartupService extends ChannelStartupService {
       if (this.safetyTimeout) {
         clearTimeout(this.safetyTimeout);
         this.safetyTimeout = null;
+      }
+    } finally {
+      // ✅ FIX #1: SEMPRE resetta isRestartInProgress per evitare deadlock
+      // Questo garantisce che anche in caso di eccezioni non catturate, il flag viene resettato
+      if (this.isRestartInProgress) {
+        this.logger.warn(
+          `[Auto-Restart] Instance ${this.instance.name} - Finally block: ensuring isRestartInProgress=false`,
+        );
+        this.isRestartInProgress = false;
       }
     }
     // NOTA: isAutoRestarting viene resettato PRIMA di chiamare createClient (fix deadlock)
@@ -1279,9 +1311,31 @@ export class BaileysStartupService extends ChannelStartupService {
         `[ForceRestart] Instance ${this.instance.name} - Attempt ${this.forceRestartAttempts} (no limit, using exponential backoff) | Reason: ${reason}`,
       );
 
+      // ✅ FIX #4: Cancella timer esistenti PRIMA di settare i flag (previene race condition)
+      if (this.connectingTimer) {
+        clearTimeout(this.connectingTimer);
+        this.connectingTimer = null;
+        this.logger.info(`[ForceRestart] Instance ${this.instance.name} - Cleared existing connectingTimer`);
+      }
+      if (this.safetyTimeout) {
+        clearTimeout(this.safetyTimeout);
+        this.safetyTimeout = null;
+        this.logger.info(`[ForceRestart] Instance ${this.instance.name} - Cleared existing safetyTimeout`);
+      }
+
       // Lock per prevenire chiamate duplicate
       this.isRestartInProgress = true;
       this.isAutoRestartTriggered = true;
+
+      // ✅ FIX #0 BUG BLOCCO PERMANENTE: Cattura stato 'open' PRIMA del cleanup
+      // Se forceRestart() è chiamato da stato 'open', dobbiamo preservare questa info
+      // per permettere all'auto-restart timer di avviarsi in 'connecting'
+      if (this.lastConnectionState === 'open') {
+        this.wasOpenBeforeReconnect = true;
+        this.logger.info(
+          `[ForceRestart] Instance ${this.instance.name} - ✅ Setting wasOpenBeforeReconnect=true (restarting from 'open' state)`,
+        );
+      }
 
       // ✅ FIX: Usa cleanupClient() per cleanup completo
       this.logger.info(`[ForceRestart] Instance ${this.instance.name} - 🧹 Starting complete client cleanup...`);
@@ -1330,6 +1384,11 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.info(`[ForceRestart] Instance ${this.instance.name} - 🔌 Creating new client (direct call)...`);
       await this.createClient(this.phoneNumber);
 
+      // ✅ FIX #2: Verifica che il client sia stato creato correttamente
+      if (!this.client) {
+        throw new Error('createClient() completed but client is null - cannot proceed');
+      }
+
       const restartDuration = Date.now() - restartStartTime;
       this.logger.info(
         `[ForceRestart] Instance ${this.instance.name} - ✅ Client creation completed in ${restartDuration}ms`,
@@ -1352,35 +1411,54 @@ export class BaileysStartupService extends ChannelStartupService {
             `[ForceRestart] Instance ${this.instance.name} - ⏰ Safety timeout: still in '${currentState}' after 30s`,
           );
 
-          // ✅ NUOVO: Triggera force close se in connecting
+          // ✅ FIX #6: Gestione corretta del safety timeout per evitare loop infinito
           if (currentState === 'connecting') {
             this.logger.warn(
-              `[ForceRestart] Instance ${this.instance.name} - 🔨 Forcing close to trigger new reconnection attempt...`,
+              `[ForceRestart] Instance ${this.instance.name} - 🔨 Safety timeout: forcing close and will retry with autoRestart()`,
             );
+
+            // ✅ FIX #6: Setta flag PRIMA del close per prevenire reconnect automatico nel close handler
+            this.isRestartInProgress = true;
 
             if (this.client) {
               this.client.ws?.close();
               this.client.end(new Error('Safety timeout - forcing close to retry'));
             }
+
+            // ✅ FIX #6: Aspetta che il close si propaghi, poi riprova con autoRestart
+            setTimeout(() => {
+              this.isRestartInProgress = false;
+              this.isAutoRestarting = false;
+              this.isAutoRestartTriggered = false;
+              this.logger.info(
+                `[ForceRestart] Instance ${this.instance.name} - 🔄 Retrying connection via autoRestart() after safety timeout...`,
+              );
+              this.autoRestart();
+            }, 2000);
+
+            this.sendDataWebhook(Events.INSTANCE_STUCK, {
+              instance: this.instance.name,
+              state: currentState,
+              action: 'safety_timeout_triggered',
+              reason: 'force_restart_timeout',
+              timeout: 30000,
+              nextAction: 'controlled_retry_via_autoRestart',
+            });
+          } else {
+            // Stato non è 'connecting' - solo reset flag
+            this.isAutoRestarting = false;
+            this.isAutoRestartTriggered = false;
+            this.isRestartInProgress = false;
+
+            this.sendDataWebhook(Events.INSTANCE_STUCK, {
+              instance: this.instance.name,
+              state: currentState,
+              action: 'safety_timeout_triggered',
+              reason: 'force_restart_timeout',
+              timeout: 30000,
+              nextAction: 'flag_reset_only',
+            });
           }
-
-          // Reset flag per permettere nuovi tentativi
-          this.isAutoRestarting = false;
-          this.isAutoRestartTriggered = false;
-          this.isRestartInProgress = false;
-
-          // ✅ FIX BUG #1: Preserva wasOpenBeforeReconnect anche dopo safety timeout
-          // NON resettare questo flag - è critico per permettere timer auto-restart su future riconnessioni
-          // this.wasOpenBeforeReconnect = this.wasOpenBeforeReconnect;  // Mantiene valore
-
-          this.sendDataWebhook(Events.INSTANCE_STUCK, {
-            instance: this.instance.name,
-            state: currentState,
-            action: 'safety_timeout_triggered',
-            reason: 'force_restart_timeout',
-            timeout: 30000,
-            nextAction: currentState === 'connecting' ? 'forced_close' : 'flag_reset',
-          });
         }
         this.safetyTimeout = null;
       }, 30000);
@@ -1402,6 +1480,15 @@ export class BaileysStartupService extends ChannelStartupService {
       if (this.safetyTimeout) {
         clearTimeout(this.safetyTimeout);
         this.safetyTimeout = null;
+      }
+    } finally {
+      // ✅ FIX #1: SEMPRE resetta isRestartInProgress per evitare deadlock
+      // Questo garantisce che anche in caso di eccezioni non catturate, il flag viene resettato
+      if (this.isRestartInProgress) {
+        this.logger.warn(
+          `[ForceRestart] Instance ${this.instance.name} - Finally block: ensuring isRestartInProgress=false`,
+        );
+        this.isRestartInProgress = false;
       }
     }
   }
@@ -5396,12 +5483,43 @@ export class BaileysStartupService extends ChannelStartupService {
     return obj;
   }
 
+  private normalizeMessageKey(key: proto.IMessageKey): any {
+    const normalizedKey = { ...key };
+
+    // Se addressingMode è 'pn' (phone number), i campi sono invertiti rispetto a 'lid'
+    // Vogliamo che remoteJidAlt contenga SEMPRE il numero di telefono
+    if ((key as any).addressingMode === 'pn' || !(key as any).addressingMode) {
+      // Da web/desktop: remoteJid = numero telefono, remoteJidAlt = LID
+      // Invertiamo: remoteJid = LID, remoteJidAlt = numero telefono
+      const phoneNumber = key.remoteJid;
+      const lid = (key as any).remoteJidAlt;
+
+      if (phoneNumber && phoneNumber.includes('@s.whatsapp.net') && lid) {
+        normalizedKey.remoteJid = lid;
+        (normalizedKey as any).remoteJidAlt = phoneNumber;
+      }
+
+      // Stesso per participant/participantAlt nei gruppi
+      const participantPhone = key.participant;
+      const participantLid = (key as any).participantAlt;
+
+      if (participantPhone && participantPhone.includes('@s.whatsapp.net') && participantLid) {
+        normalizedKey.participant = participantLid;
+        (normalizedKey as any).participantAlt = participantPhone;
+      }
+    }
+    // Se addressingMode è 'lid', i campi sono già nel formato corretto:
+    // remoteJid = LID, remoteJidAlt = numero telefono
+
+    return normalizedKey;
+  }
+
   private prepareMessage(message: proto.IWebMessageInfo): any {
     const contentType = getContentType(message.message);
     const contentMsg = message?.message[contentType] as any;
 
     const messageRaw = {
-      key: message.key, // Save key exactly as it comes from Baileys
+      key: this.normalizeMessageKey(message.key), // Normalized: remoteJidAlt always contains phone number
       pushName:
         message.pushName ||
         (message.key.fromMe
