@@ -175,6 +175,7 @@ async function bootstrap() {
 
     // Chiudere istanze WhatsApp con timeout
     const shutdownTimeout = 30000; // 30 secondi max per shutdown
+    const instanceTimeout = 5000; // 5 secondi max per istanza
     const shutdownStart = Date.now();
 
     try {
@@ -182,7 +183,7 @@ async function bootstrap() {
       logger.info(`Closing ${instanceNames.length} WhatsApp instance(s)...`);
 
       for (const name of instanceNames) {
-        // Check timeout
+        // Check timeout globale
         if (Date.now() - shutdownStart > shutdownTimeout) {
           logger.warn('Shutdown timeout reached, forcing exit');
           break;
@@ -190,9 +191,27 @@ async function bootstrap() {
 
         try {
           const instance = waMonitor.waInstances[name];
+
+          // ✅ FIX: Cleanup ResourceRegistry PRIMA di chiudere il client
+          if (instance?.resourceRegistry) {
+            const cleanupResult = instance.resourceRegistry.cleanupAll('graceful_shutdown');
+            logger.info(
+              `Instance ${name} resources cleaned: ${cleanupResult.total} ` +
+                `(${cleanupResult.timers} timers, ${cleanupResult.listeners} listeners, ${cleanupResult.processes} processes)`,
+            );
+          }
+
+          // ✅ FIX: Timeout individuale su client.end() per evitare blocchi
           if (instance?.client) {
-            await instance.client.end('shutdown');
-            logger.info(`Instance ${name} closed`);
+            try {
+              await Promise.race([
+                instance.client.end('shutdown'),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('client.end timeout')), instanceTimeout)),
+              ]);
+              logger.info(`Instance ${name} closed`);
+            } catch (endError: any) {
+              logger.warn(`Instance ${name} end timeout/error: ${endError.message}, forcing cleanup`);
+            }
           }
         } catch (e: any) {
           logger.error(`Error closing instance ${name}: ${e.message}`);

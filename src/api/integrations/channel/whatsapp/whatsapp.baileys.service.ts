@@ -81,7 +81,7 @@ import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 // ✅ DEFENSE IN DEPTH: Import nuove utility per protezione 100%
-import { TimeoutError, withDbTimeout } from '@utils/async-timeout';
+import { TimeoutError, withDbTimeout, withRedisTimeout } from '@utils/async-timeout';
 import { CircuitBreaker } from '@utils/circuit-breaker';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
@@ -2533,14 +2533,17 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           const messageKey = `${this.instance.id}_${received.key.id}`;
-          const cached = await this.baileysCache.get(messageKey);
+          const cached = await withRedisTimeout(this.baileysCache.get(messageKey), 'messagesUpsert:checkDuplicate');
 
           if (cached && !editedMessage && !requestId) {
             this.logger.info(`Message duplicated ignored: ${received.key.id}`);
             continue;
           }
 
-          await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
+          await withRedisTimeout(
+            this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS),
+            'messagesUpsert:setDuplicate',
+          );
 
           if (
             (type !== 'notify' && type !== 'append') ||
@@ -2659,7 +2662,10 @@ export class BaileysStartupService extends ChannelStartupService {
             const fromMe = received.key.fromMe.toString();
             const messageKey = `${remoteJid}_${timestamp}_${fromMe}`;
 
-            const cachedTimestamp = await this.baileysCache.get(messageKey);
+            const cachedTimestamp = await withRedisTimeout(
+              this.baileysCache.get(messageKey),
+              'messagesUpsert:checkPolling',
+            );
 
             if (!cachedTimestamp) {
               if (!received.key.fromMe) {
@@ -2676,7 +2682,10 @@ export class BaileysStartupService extends ChannelStartupService {
                 await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
               }
 
-              await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
+              await withRedisTimeout(
+                this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS),
+                'messagesUpsert:setPolling',
+              );
             } else {
               this.logger.info(`Update readed messages duplicated ignored [avoid deadlock]: ${messageKey}`);
             }
@@ -2879,14 +2888,14 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const updateKey = `${this.instance.id}_${key.id}_${update.status}`;
 
-        const cached = await this.baileysCache.get(updateKey);
+        const cached = await withRedisTimeout(this.baileysCache.get(updateKey), 'messagesUpdate:checkDuplicate');
 
         if (cached) {
           this.logger.info(`Message duplicated ignored [avoid deadlock]: ${updateKey}`);
           continue;
         }
 
-        await this.baileysCache.set(updateKey, true, 30 * 60);
+        await withRedisTimeout(this.baileysCache.set(updateKey, true, 30 * 60), 'messagesUpdate:setDuplicate');
 
         if (status[update.status] === 'READ' && key.fromMe) {
           if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
@@ -2975,13 +2984,19 @@ export class BaileysStartupService extends ChannelStartupService {
               const fromMe = key.fromMe.toString();
               const messageKey = `${remoteJid}_${timestamp}_${fromMe}`;
 
-              const cachedTimestamp = await this.baileysCache.get(messageKey);
+              const cachedTimestamp = await withRedisTimeout(
+                this.baileysCache.get(messageKey),
+                'messageUpdate:checkDuplicate',
+              );
 
               if (!cachedTimestamp) {
                 if (status[update.status] === status[4]) {
                   this.logger.log(`Update as read in message.update ${remoteJid} - ${timestamp}`);
                   await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
-                  await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
+                  await withRedisTimeout(
+                    this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS),
+                    'messageUpdate:setDuplicate',
+                  );
                 }
 
                 // ✅ FIX 1: Wrap DB query with timeout
