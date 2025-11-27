@@ -2,6 +2,40 @@
 
 This file provides comprehensive guidance to Claude AI when working with the Evolution API codebase.
 
+---
+
+## IMPORTANT NOTES FOR CLAUDE
+
+### GitHub Fork - DO NOT PUSH MULTIPLE TIMES
+- This repository is a **FORK** at `github.com/Leader24-TOP-AI/evolution-api`
+- **CONSOLIDATE changes into single commits** before pushing
+- Always **verify push succeeded** before attempting again
+- If push fails, diagnose the issue first - don't retry blindly
+
+### Translations Required - ALWAYS ADD ALL LANGUAGES
+When creating new UI text, **ALWAYS** add translations to ALL languages:
+
+**Frontend (5 languages)** - `evolution-manager-v2/src/translate/languages/`:
+| File | Language | Notes |
+|------|----------|-------|
+| `it-IT.json` | Italian | **DEFAULT** - Start here |
+| `en-US.json` | English | |
+| `pt-BR.json` | Portuguese (Brazil) | |
+| `es-ES.json` | Spanish | |
+| `fr-FR.json` | French | |
+
+**Backend (3 languages)** - `src/utils/translations/` - Only for Chatwoot messages:
+| File | Language |
+|------|----------|
+| `en.json` | English |
+| `pt-BR.json` | Portuguese |
+| `es.json` | Spanish |
+
+### Use Ultrathink for Deep Analysis
+When analyzing complex issues or debugging system problems, use extended thinking mode for thorough analysis.
+
+---
+
 ## Project Overview
 
 **Evolution API** is a powerful, production-ready REST API for WhatsApp communication that supports multiple WhatsApp providers:
@@ -124,6 +158,105 @@ src/
 - **MinIO**: Self-hosted S3-compatible storage
 - Media file management and URL generation
 
+---
+
+## Defense in Depth Architecture
+
+A multi-layered protection system to prevent and recover from WhatsApp instance freezing/hanging.
+
+### Layer 1: Timeout Protection (Immediate)
+**File**: `src/utils/async-timeout.ts`
+
+Wraps all async operations with configurable timeouts:
+| Operation Type | Timeout | Description |
+|----------------|---------|-------------|
+| Database queries | 5000ms | Prisma operations |
+| Redis operations | 3000ms | Cache read/write |
+| WebSocket events | 2000ms | Socket communication |
+| HTTP requests | 10000ms | External API calls |
+
+```typescript
+// Usage example
+const result = await withTimeout(
+  prisma.instance.findMany(),
+  TIMEOUT_DEFAULTS.DATABASE,
+  'fetch instances'
+);
+```
+
+### Layer 2: Circuit Breaker (Prevention)
+**File**: `src/utils/circuit-breaker.ts`
+
+Prevents cascade failures with state machine pattern:
+```
+CLOSED → OPEN (after 5 failures) → HALF_OPEN (after 60s) → CLOSED (after 2 successes)
+     ↑                                                              ↓
+     └──────────────────────────────────────────────────────────────┘
+```
+
+| State | Behavior |
+|-------|----------|
+| CLOSED | Normal operation, tracking failures |
+| OPEN | All requests fail fast, no actual execution |
+| HALF_OPEN | Testing recovery with limited requests |
+
+**Per-Instance Circuits**: Each WhatsApp instance has its own circuit breaker to isolate failures.
+
+### Layer 3: External Watchdog (Recovery)
+**Files**: `src/watchdog/watchdog.service.ts`, `src/watchdog/index.ts`
+
+Runs as **SEPARATE PM2 process** - can recover even if main process is frozen:
+
+**Detection Methods**:
+| Issue | Detection Time | Trigger |
+|-------|---------------|---------|
+| Stale heartbeat | 90 seconds | No heartbeat update |
+| Stuck connecting | 120 seconds | In 'connecting' state too long |
+| Circuit stuck OPEN | - | Logged, not auto-recovered |
+
+**Recovery Escalation**:
+1. **API Restart** (attempts 1-2): Gentle restart via REST API
+2. **DB Flag** (attempts 3-5): Force reconnection via database flag
+3. **PM2 Restart** (attempt 6+): Nuclear option, restart entire process
+
+### Resource Registry (Cleanup)
+**File**: `src/utils/resource-registry.ts`
+
+Centralized tracking for all resources to prevent memory leaks:
+- Timers (setTimeout/setInterval)
+- Event listeners
+- Child processes (FFmpeg, etc.)
+- `cleanupAll()` method for emergency cleanup
+
+### Database Tables
+| Table | Purpose |
+|-------|---------|
+| `WatchdogHeartbeat` | Per-instance health tracking (lastHeartbeat, state, recoveryAttempts) |
+| `HealthEvent` | Recovery event logging (eventType, severity, message, details) |
+
+### PM2 Configuration
+**File**: `ecosystem.config.js`
+```javascript
+apps: [
+  { name: 'evolution-api', script: 'dist/main.js', instances: 1 },
+  { name: 'evolution-watchdog', script: 'dist/watchdog/index.js', instances: 1 }
+]
+```
+
+### Monitoring Commands
+```bash
+# View both processes
+pm2 list
+
+# Watchdog logs
+pm2 logs evolution-watchdog
+
+# Debug mode (verbose logging)
+WATCHDOG_DEBUG=true pm2 restart evolution-watchdog
+```
+
+---
+
 ### Database Schema Management
 - Separate schema files: `postgresql-schema.prisma` and `mysql-schema.prisma`
 - Environment variable `DATABASE_PROVIDER` determines active database
@@ -156,10 +289,132 @@ src/
 - Media URL generation for external access
 - Support for audio transcription via OpenAI
 
+---
+
+## Translation System
+
+### Frontend i18n (React)
+**Location**: `evolution-manager-v2/src/translate/`
+
+**Available Languages**:
+| Code | Language | File |
+|------|----------|------|
+| `it-IT` | Italian | `languages/it-IT.json` (DEFAULT) |
+| `en-US` | English | `languages/en-US.json` |
+| `pt-BR` | Portuguese | `languages/pt-BR.json` |
+| `es-ES` | Spanish | `languages/es-ES.json` |
+| `fr-FR` | French | `languages/fr-FR.json` |
+
+**Usage Pattern**:
+```typescript
+import { useTranslation } from 'react-i18next';
+
+function MyComponent() {
+  const { t } = useTranslation();
+  return <h1>{t('dashboard.title')}</h1>;
+}
+```
+
+**Key Naming Convention**:
+```json
+{
+  "section": {
+    "subsection": {
+      "key": "Value",
+      "keyWithVar": "Hello {{name}}"
+    }
+  }
+}
+```
+
+| Pattern | Example | Usage |
+|---------|---------|-------|
+| `section.title` | `dashboard.title` | Section headers |
+| `button.action` | `button.save`, `button.cancel` | Button labels |
+| `button.actionLoading` | `button.saving` | Loading states |
+| `toast.type.context` | `toast.success.saved` | Notifications |
+| `form.field.type` | `form.email.placeholder` | Form fields |
+| `table.column` | `table.name`, `table.status` | Table headers |
+
+### Backend i18n (Node.js)
+**Location**: `src/utils/translations/`
+
+Used for Chatwoot integration messages:
+| File | Language |
+|------|----------|
+| `en.json` | English |
+| `pt-BR.json` | Portuguese |
+| `es.json` | Spanish |
+
+**Usage Pattern**:
+```typescript
+import i18next from 'i18next';
+
+const message = i18next.t('chatwoot.welcome_message');
+```
+
+### Adding New Translations Checklist
+1. Add key to **ALL 5** frontend language files
+2. Start with `it-IT.json` (default language)
+3. Use hierarchical naming (`section.subsection.key`)
+4. Use `{{variable}}` syntax for dynamic values
+5. Keep translations consistent across languages
+6. Test UI in all languages if possible
+
+---
+
 ### Multi-tenancy Support
 - Instance isolation at database level
 - Separate webhook configurations per instance
 - Independent integration settings per instance
+
+---
+
+## Health Monitor Dashboard
+
+### Overview
+Real-time monitoring dashboard for WhatsApp instances and system health.
+
+**Backend**: `src/api/services/health-monitor.service.ts`
+**Frontend**: `evolution-manager-v2/src/pages/HealthMonitorDashboard/`
+**Route**: `/health-monitor` in the manager UI
+
+### API Endpoints
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/health-monitor/dashboard` | Complete dashboard data |
+| GET | `/health-monitor/instances` | All instances health status |
+| GET | `/health-monitor/system` | System health metrics |
+| GET | `/health-monitor/events` | Recent health events |
+| POST | `/health-monitor/circuit-breaker/reset/:name` | Reset a circuit breaker |
+
+### Health Score Calculation (0-100)
+Each instance starts at 100 and receives penalties:
+
+| Condition | Penalty | Detection |
+|-----------|---------|-----------|
+| Connection closed | -30 | `connectionStatus === 'close'` |
+| No heartbeat >90s | -40 | `lastHeartbeat` age check |
+| Stuck connecting >120s | -30 | `stuckSince` duration |
+| Circuit breaker OPEN | -25 | `circuitState === 'OPEN'` |
+| Recovery attempts >5 | -20 | `recoveryAttempts` count |
+
+### Dashboard Components
+1. **System Health Card**: CPU, Memory, Uptime
+2. **Instances Health Table**: Per-instance status with health scores
+3. **Watchdog Metrics Card**: Recovery statistics, success rate
+4. **Recent Events Timeline**: Health events log
+
+### Watchdog Metrics
+| Metric | Description |
+|--------|-------------|
+| `status` | running/stopped/unknown |
+| `uptime` | Seconds since process start |
+| `recoveriesTotal` | All-time recovery count |
+| `recoveriesToday` | Last 24 hours recoveries |
+| `successRate` | Successful recoveries percentage |
+
+---
 
 ## Environment Configuration
 
@@ -288,6 +543,108 @@ git push origin main
 
 ---
 
+## Git Workflow (Fork Repository)
+
+### CRITICAL: This is a Fork
+| Property | Value |
+|----------|-------|
+| **Origin** | `github.com/Leader24-TOP-AI/evolution-api` |
+| **Type** | Fork (not original repository) |
+| **Branch** | `main` |
+
+**DO NOT**:
+- Push multiple times without verifying previous push succeeded
+- Use `git add .` (too broad)
+- Force push (`--force`)
+- Amend commits that were already pushed
+
+### Git Submodule: evolution-manager-v2
+The frontend is a **git submodule** - a separate repository inside this one.
+
+**Submodule Location**: `evolution-manager-v2/`
+
+**Correct Workflow for Submodule Changes**:
+```bash
+# 1. Make changes in submodule
+cd evolution-manager-v2
+# ... edit files ...
+
+# 2. Commit in submodule FIRST
+git add <modified-files>
+git commit -m "feat: submodule changes"
+git push origin main
+
+# 3. Go back to parent
+cd ..
+
+# 4. Build and copy to manager/dist
+npm run build --prefix evolution-manager-v2
+rm -rf manager/dist
+cp -r evolution-manager-v2/dist manager/dist
+
+# 5. Update parent reference to new submodule commit
+git add evolution-manager-v2 manager/dist
+git commit -m "feat: update frontend submodule"
+git push origin main
+```
+
+### Pre-commit Hooks (Husky)
+**Configuration**: `.husky/` directory
+
+| Hook | Action |
+|------|--------|
+| `pre-commit` | ESLint auto-fix on staged files |
+| `commit-msg` | Commitlint validates message format |
+
+### Commit Message Format (Conventional Commits)
+```
+type(scope): subject
+
+body (optional)
+
+footer (optional)
+```
+
+**Types**:
+| Type | Usage |
+|------|-------|
+| `feat` | New feature |
+| `fix` | Bug fix |
+| `docs` | Documentation only |
+| `style` | Code style (formatting, semicolons) |
+| `refactor` | Code change that neither fixes bug nor adds feature |
+| `perf` | Performance improvement |
+| `test` | Adding tests |
+| `chore` | Maintenance tasks |
+| `ci` | CI/CD changes |
+| `build` | Build system changes |
+
+**Rules**:
+- Subject: **lowercase**, no period at end, max 100 chars
+- Scope: optional, lowercase
+- Body: wrap at 100 chars
+
+**Examples**:
+```bash
+# Good
+git commit -m "feat(auth): add jwt token refresh"
+git commit -m "fix: resolve memory leak in websocket handler"
+git commit -m "docs: update claude.md with defense in depth"
+
+# Bad - will be rejected by commitlint
+git commit -m "Added new feature"  # Wrong: past tense, no type
+git commit -m "feat: Add Feature." # Wrong: capital letter, period
+```
+
+### Log Rotation
+**Configuration**: `/etc/logrotate.d/pm2-evolution-api`
+
+PM2 logs are rotated daily with 90-day retention:
+- `evolution-api-*.log`
+- `evolution-watchdog-*.log`
+
+---
+
 ## Deployment Considerations
 
 - Docker support with `Dockerfile` and `docker-compose.yaml`
@@ -304,31 +661,85 @@ git push origin main
 
 **Issue**: After extended periods of connection (several hours), WhatsApp instances may experience disconnections with statusCode 408 (timeout) or 428 (connection closed), typically related to proxy IP changes or network instability.
 
-**System Behavior**:
-- Instances have automatic reconnection system with multiple safety nets
-- Auto-restart timer (5s) for quick recovery
-- Health check monitoring (every 60s, detects stuck state within 10s)
-- Safety timeout (30s) as final fallback
+**Defense in Depth Protection** (see "Defense in Depth Architecture" section):
+The system has a 3-layer protection mechanism:
+
+| Layer | Component | Detection Time | Action |
+|-------|-----------|----------------|--------|
+| 1 | Timeout Protection | Immediate | Prevents hanging operations |
+| 2 | Circuit Breaker | After 5 failures | Isolates failing instance |
+| 3 | External Watchdog | 90-120 seconds | Escalating recovery |
 
 **Expected Recovery Time**:
-- Normal disconnection: 2-5 seconds (automatic)
-- Stuck in connecting: 5-15 seconds (auto-restart triggered)
+| Scenario | Recovery Time | Mechanism |
+|----------|---------------|-----------|
+| Normal disconnection | 2-5 seconds | Internal reconnection |
+| Stuck in connecting | 90-120 seconds | Watchdog detection |
+| Circuit breaker OPEN | 60 seconds | Automatic half-open test |
+| Complete freeze | 60-180 seconds | Watchdog PM2 restart |
 
 **If Manual Intervention Needed**:
 - Dashboard restart button available per instance
 - API endpoint: `POST /instance/restart/:instanceName`
-- Test endpoint for validation: `POST /instance/simulate-disconnect/:instanceName`
+- Reset circuit breaker: `POST /health-monitor/circuit-breaker/reset/:name`
+- Health dashboard: `/health-monitor` in manager UI
 
-**Monitoring**:
+**Monitoring Commands**:
 ```bash
-# Watch instance health
-pm2 logs evolution-api | grep "Auto-Restart\|HealthCheck\|CONNECTED"
+# Watch both processes
+pm2 list
 
-# Test auto-reconnection
-npm run test:reconnect
+# API logs with health info
+pm2 logs evolution-api | grep -E "Auto-Restart|HealthCheck|CONNECTED|Circuit"
+
+# Watchdog logs (separate process)
+pm2 logs evolution-watchdog
+
+# Enable watchdog debug mode
+WATCHDOG_DEBUG=true pm2 restart evolution-watchdog
+
+# Check health dashboard API
+curl http://localhost:8080/health-monitor/dashboard -H "apikey: YOUR_KEY"
 ```
+
+**Troubleshooting Escalation**:
+1. Check Health Dashboard (`/health-monitor`) for health scores
+2. Check Watchdog status: `pm2 show evolution-watchdog`
+3. View recent health events in dashboard
+4. If circuit breaker stuck OPEN, reset via API
+5. If watchdog not recovering, check DB connectivity
 
 **Related Files**:
 - Connection management: `src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts`
-- Instance monitoring: `src/api/services/monitor.service.ts`
-- Test utilities: `test/reconnect-test.ts` (if present)
+- Health Monitor: `src/api/services/health-monitor.service.ts`
+- Circuit Breaker: `src/utils/circuit-breaker.ts`
+- Watchdog Service: `src/watchdog/watchdog.service.ts`
+- Resource Registry: `src/utils/resource-registry.ts`
+- Async Timeout: `src/utils/async-timeout.ts`
+
+### Database Connection Issues
+
+**Symptoms**: Slow queries, timeouts, connection pool exhaustion
+
+**Protection**: Layer 1 Timeout Protection wraps all DB queries with 5000ms timeout
+
+**Monitoring**:
+```bash
+# Check circuit breaker state
+curl http://localhost:8080/health-monitor/dashboard -H "apikey: YOUR_KEY" | jq '.instances[].circuitState'
+```
+
+### Memory Leaks
+
+**Symptoms**: Gradual memory increase, eventual crash
+
+**Protection**: Resource Registry tracks all timers, listeners, and child processes
+
+**Monitoring**:
+```bash
+# Check memory usage
+pm2 show evolution-api | grep memory
+
+# View resource stats via Health Monitor API
+curl http://localhost:8080/health-monitor/system -H "apikey: YOUR_KEY"
+```
