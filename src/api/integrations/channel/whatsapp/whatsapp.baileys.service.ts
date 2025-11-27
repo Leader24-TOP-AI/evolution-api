@@ -514,7 +514,16 @@ export class BaileysStartupService extends ChannelStartupService {
     this.autoRestartAttempts = 0;
     this.forceRestartAttempts = 0;
 
-    await this.client?.logout('Log out instance: ' + this.instanceName);
+    // ✅ FIX: Wrap logout in try-catch to handle "Connection Closed" error
+    // when trying to logout from an already disconnected instance
+    try {
+      await this.client?.logout('Log out instance: ' + this.instanceName);
+    } catch (error) {
+      this.logger.warn(
+        `[Logout] Instance ${this.instance.name} - Failed to send logout to WhatsApp ` +
+          `(connection may be already closed): ${error.message}`,
+      );
+    }
 
     // ✅ FIX #6: Reset ownerJid al logout per permettere riuso nome istanza
     // ✅ FIX 2.5: Aggiungo timeout per evitare blocco durante logout
