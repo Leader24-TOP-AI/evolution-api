@@ -58,6 +58,7 @@ export class WatchdogService {
   private config: WatchdogConfig;
   private checkTimer: NodeJS.Timeout | null = null;
   private isRunning = false;
+  private isCheckRunning = false; // ✅ FIX 3: Prevent overlapping check cycles
   private logger: Console;
 
   constructor(config: Partial<WatchdogConfig> = {}) {
@@ -82,7 +83,8 @@ export class WatchdogService {
     if (this.isRunning) return;
     this.isRunning = true;
 
-    await this.prisma.$connect();
+    // ✅ FIX 5: Timeout on $connect to prevent blocking
+    await withWatchdogTimeout(this.prisma.$connect(), 'prismaConnect');
     this.log('INFO', `Watchdog started - PID: ${process.pid}`);
     this.log(
       'INFO',
@@ -118,7 +120,12 @@ export class WatchdogService {
       this.checkTimer = null;
     }
 
-    await this.prisma.$disconnect();
+    // ✅ FIX 5: Timeout on $disconnect to prevent blocking during shutdown
+    try {
+      await withWatchdogTimeout(this.prisma.$disconnect(), 'prismaDisconnect');
+    } catch (e) {
+      this.log('WARN', `Disconnect timeout during shutdown: ${e}`);
+    }
     this.log('INFO', 'Watchdog stopped');
     process.exit(0);
   }
@@ -134,9 +141,9 @@ export class WatchdogService {
     } catch (error) {
       this.log('ERROR', `DB health check failed: ${error}`);
       try {
-        // Try to reconnect
-        await this.prisma.$disconnect();
-        await this.prisma.$connect();
+        // ✅ FIX 5: Timeout on reconnection attempts
+        await withWatchdogTimeout(this.prisma.$disconnect(), 'healthCheckDisconnect');
+        await withWatchdogTimeout(this.prisma.$connect(), 'healthCheckReconnect');
         this.log('INFO', 'DB reconnection successful');
         return true;
       } catch (reconnectError) {
@@ -150,6 +157,24 @@ export class WatchdogService {
    * Check all instances for health issues
    */
   private async checkAllInstances(): Promise<void> {
+    // ✅ FIX 3: Prevent overlapping check cycles
+    if (this.isCheckRunning) {
+      this.log('WARN', 'Previous check still running, skipping this cycle');
+      return;
+    }
+
+    this.isCheckRunning = true;
+    try {
+      await this._performInstanceChecks();
+    } finally {
+      this.isCheckRunning = false;
+    }
+  }
+
+  /**
+   * Internal method that performs the actual instance checks
+   */
+  private async _performInstanceChecks(): Promise<void> {
     // ✅ FIX 2.4: Verify DB is healthy before proceeding
     if (!(await this.checkDatabaseHealth())) {
       this.log('ERROR', 'DB unavailable, skipping check cycle');
@@ -251,24 +276,23 @@ export class WatchdogService {
     instanceId: string,
     instanceName: string,
     reason: string,
-    currentAttempts: number,
+    _currentAttempts: number, // eslint-disable-line @typescript-eslint/no-unused-vars
   ): Promise<void> {
-    const attempts = currentAttempts + 1;
-
-    // Log the recovery attempt
-    await this.logRecoveryEvent(instanceId, reason, attempts);
-
-    // ✅ FIX 1.4: Update recovery attempts in heartbeat (con timeout)
-    await withWatchdogTimeout(
+    // ✅ FIX 4: Use atomic increment to prevent race conditions
+    const updated = await withWatchdogTimeout(
       this.prisma.watchdogHeartbeat.update({
         where: { instanceId },
         data: {
-          recoveryAttempts: attempts,
+          recoveryAttempts: { increment: 1 }, // ATOMIC increment
           lastRecovery: new Date(),
         },
       }),
       'updateRecoveryAttempts',
     );
+    const attempts = updated.recoveryAttempts;
+
+    // Log the recovery attempt
+    await this.logRecoveryEvent(instanceId, reason, attempts);
 
     // ✅ FIX 2.2: Exponential backoff - evita recovery troppo rapidi che non aiutano
     const backoffMs = Math.min(1000 * Math.pow(2, attempts - 1), 30000); // 1s, 2s, 4s, 8s, 16s, max 30s

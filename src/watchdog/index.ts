@@ -58,13 +58,15 @@ watchdog.start().catch((error) => {
   process.exit(1);
 });
 
-// Keep process running
+// Handle critical errors - exit so PM2 can restart with clean state
 process.on('uncaughtException', (error) => {
-  console.error('Uncaught exception in watchdog:', error);
-  // Don't exit - watchdog should be resilient
+  console.error('CRITICAL: Uncaught exception in watchdog:', error);
+  // Exit after brief delay to allow logging
+  setTimeout(() => process.exit(1), 500);
 });
 
 process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled rejection in watchdog:', reason);
-  // Don't exit - watchdog should be resilient
+  console.error('CRITICAL: Unhandled rejection in watchdog:', reason);
+  // Exit after brief delay to allow logging
+  setTimeout(() => process.exit(1), 500);
 });

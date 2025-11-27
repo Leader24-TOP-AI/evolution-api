@@ -702,6 +702,8 @@ export class BaileysStartupService extends ChannelStartupService {
       this.globalRestartResetTimer = setTimeout(() => {
         this.globalRestartCounter = 0;
       }, this.GLOBAL_RESTART_WINDOW);
+      // ✅ FIX 2: Register timer to prevent memory leak
+      this.resourceRegistry.addTimer(this.globalRestartResetTimer, 'globalRestartResetTimer');
 
       // ✅ BACKOFF: Reset delay e registra timestamp successo
       this.currentRestartDelay = this.MIN_RESTART_DELAY;
@@ -1023,7 +1025,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             // ✅ FIX #6: Aspetta che il close si propaghi, poi riprova con autoRestart
-            setTimeout(() => {
+            const autoRestartRetryTimer = setTimeout(() => {
               this.isRestartInProgress = false;
               this.isAutoRestarting = false;
               this.isAutoRestartTriggered = false;
@@ -1032,6 +1034,8 @@ export class BaileysStartupService extends ChannelStartupService {
               );
               this.autoRestart();
             }, 2000);
+            // ✅ FIX 2: Register timer to prevent memory leak
+            this.resourceRegistry.addTimer(autoRestartRetryTimer, 'autoRestartRetryTimer');
 
             this.sendDataWebhook(Events.INSTANCE_STUCK, {
               instance: this.instance.name,
@@ -1095,25 +1099,39 @@ export class BaileysStartupService extends ChannelStartupService {
     // Safety timeout si occupa di reset in caso di problemi
   }
 
+  /**
+   * ✅ FIX 2: Rewritten to use setInterval instead of recursive setTimeout
+   * This prevents memory leak from hundreds of untracked timers
+   */
   private waitForState(expectedState: string, timeoutMs: number): Promise<boolean> {
     return new Promise((resolve) => {
       const startTime = Date.now();
 
-      const checkState = () => {
+      // Check immediately first
+      if (this.stateConnection.state === expectedState) {
+        resolve(true);
+        return;
+      }
+
+      // Use single interval instead of recursive setTimeout
+      const checkInterval = setInterval(() => {
+        // Check state
         if (this.stateConnection.state === expectedState) {
+          clearInterval(checkInterval);
           resolve(true);
           return;
         }
 
+        // Check timeout
         if (Date.now() - startTime >= timeoutMs) {
+          clearInterval(checkInterval);
           resolve(false);
           return;
         }
+      }, 100); // Poll every 100ms
 
-        setTimeout(checkState, 100); // Poll ogni 100ms
-      };
-
-      checkState();
+      // Register interval to prevent memory leak (will be cleaned on logout)
+      this.resourceRegistry.addInterval(checkInterval, 'waitForStateCheck');
     });
   }
 
@@ -1693,7 +1711,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             // ✅ FIX #6: Aspetta che il close si propaghi, poi riprova con autoRestart
-            setTimeout(() => {
+            const forceRestartRetryTimer = setTimeout(() => {
               this.isRestartInProgress = false;
               this.isAutoRestarting = false;
               this.isAutoRestartTriggered = false;
@@ -1702,6 +1720,8 @@ export class BaileysStartupService extends ChannelStartupService {
               );
               this.autoRestart();
             }, 2000);
+            // ✅ FIX 2: Register timer to prevent memory leak
+            this.resourceRegistry.addTimer(forceRestartRetryTimer, 'forceRestartRetryTimer');
 
             this.sendDataWebhook(Events.INSTANCE_STUCK, {
               instance: this.instance.name,
@@ -1997,10 +2017,14 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private readonly chatHandle = {
     'chats.upsert': async (chats: Chat[]) => {
-      const existingChatIds = await this.prismaRepository.chat.findMany({
-        where: { instanceId: this.instanceId },
-        select: { remoteJid: true },
-      });
+      // ✅ FIX 1: Wrap DB query with timeout
+      const existingChatIds = await withDbTimeout(
+        this.prismaRepository.chat.findMany({
+          where: { instanceId: this.instanceId },
+          select: { remoteJid: true },
+        }),
+        'chatHandle:findMany',
+      );
 
       const existingChatIdSet = new Set(existingChatIds.map((chat) => chat.remoteJid));
 
@@ -2017,7 +2041,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
       if (chatsToInsert.length > 0) {
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS)
-          await this.prismaRepository.chat.createMany({ data: chatsToInsert, skipDuplicates: true });
+          // ✅ FIX 1: Wrap DB query with timeout
+          await withDbTimeout(
+            this.prismaRepository.chat.createMany({ data: chatsToInsert, skipDuplicates: true }),
+            'chatHandle:createMany',
+          );
       }
     },
 
@@ -2035,18 +2063,25 @@ export class BaileysStartupService extends ChannelStartupService {
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
 
       for (const chat of chats) {
-        await this.prismaRepository.chat.updateMany({
-          where: { instanceId: this.instanceId, remoteJid: chat.id, name: chat.name },
-          data: { remoteJid: chat.id },
-        });
+        // ✅ FIX 1: Wrap DB query with timeout
+        await withDbTimeout(
+          this.prismaRepository.chat.updateMany({
+            where: { instanceId: this.instanceId, remoteJid: chat.id, name: chat.name },
+            data: { remoteJid: chat.id },
+          }),
+          'chatHandle:updateMany',
+        );
       }
     },
 
     'chats.delete': async (chats: string[]) => {
-      chats.forEach(
-        async (chat) =>
-          await this.prismaRepository.chat.deleteMany({ where: { instanceId: this.instanceId, remoteJid: chat } }),
-      );
+      // ✅ FIX 1: Wrap DB queries with timeout (using for...of instead of forEach for proper await)
+      for (const chat of chats) {
+        await withDbTimeout(
+          this.prismaRepository.chat.deleteMany({ where: { instanceId: this.instanceId, remoteJid: chat } }),
+          'chatHandle:deleteMany',
+        );
+      }
 
       this.sendDataWebhook(Events.CHATS_DELETE, [...chats]);
     },
@@ -2066,7 +2101,11 @@ export class BaileysStartupService extends ChannelStartupService {
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-            await this.prismaRepository.contact.createMany({ data: contactsRaw, skipDuplicates: true });
+            // ✅ FIX 1: Wrap DB query with timeout
+            await withDbTimeout(
+              this.prismaRepository.contact.createMany({ data: contactsRaw, skipDuplicates: true }),
+              'contactHandle:createMany',
+            );
 
           const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
           if (usersContacts) {
@@ -2108,10 +2147,14 @@ export class BaileysStartupService extends ChannelStartupService {
           this.sendDataWebhook(Events.CONTACTS_UPDATE, updatedContacts);
           await Promise.all(
             updatedContacts.map(async (contact) => {
-              const update = this.prismaRepository.contact.updateMany({
-                where: { remoteJid: contact.remoteJid, instanceId: this.instanceId },
-                data: { profilePicUrl: contact.profilePicUrl },
-              });
+              // ✅ FIX 1: Wrap DB query with timeout
+              const update = withDbTimeout(
+                this.prismaRepository.contact.updateMany({
+                  where: { remoteJid: contact.remoteJid, instanceId: this.instanceId },
+                  data: { profilePicUrl: contact.profilePicUrl },
+                }),
+                'contactHandle:updateMany',
+              );
 
               if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
                 const instance = { instanceName: this.instance.name, instanceId: this.instance.id };
@@ -2162,7 +2205,8 @@ export class BaileysStartupService extends ChannelStartupService {
           update: contact,
         }),
       );
-      await this.prismaRepository.$transaction(updateTransactions);
+      // ✅ FIX 1: Wrap DB transaction with timeout
+      await withDbTimeout(this.prismaRepository.$transaction(updateTransactions), 'contactHandle:transaction');
 
       //const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
     },
@@ -2220,10 +2264,14 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         const chatsRaw: { remoteJid: string; instanceId: string; name?: string }[] = [];
+        // ✅ FIX 1: Wrap DB query with timeout
         const chatsRepository = new Set(
-          (await this.prismaRepository.chat.findMany({ where: { instanceId: this.instanceId } })).map(
-            (chat) => chat.remoteJid,
-          ),
+          (
+            await withDbTimeout(
+              this.prismaRepository.chat.findMany({ where: { instanceId: this.instanceId } }),
+              'historySync:chatFindMany',
+            )
+          ).map((chat) => chat.remoteJid),
         );
 
         for (const chat of chats) {
@@ -2237,18 +2285,26 @@ export class BaileysStartupService extends ChannelStartupService {
         this.sendDataWebhook(Events.CHATS_SET, chatsRaw);
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-          await this.prismaRepository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
+          // ✅ FIX 1: Wrap DB query with timeout
+          await withDbTimeout(
+            this.prismaRepository.chat.createMany({ data: chatsRaw, skipDuplicates: true }),
+            'historySync:chatCreateMany',
+          );
         }
 
         const messagesRaw: any[] = [];
 
+        // ✅ FIX 1: Wrap DB query with timeout
         const messagesRepository: Set<string> = new Set(
           chatwootImport.getRepositoryMessagesCache(instance) ??
             (
-              await this.prismaRepository.message.findMany({
-                select: { key: true },
-                where: { instanceId: this.instanceId },
-              })
+              await withDbTimeout(
+                this.prismaRepository.message.findMany({
+                  select: { key: true },
+                  where: { instanceId: this.instanceId },
+                }),
+                'historySync:messageFindMany',
+              )
             ).map((message) => {
               const key = message.key as { id: string };
 
@@ -2294,7 +2350,11 @@ export class BaileysStartupService extends ChannelStartupService {
         this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw]);
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-          await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
+          // ✅ FIX 1: Wrap DB query with timeout
+          await withDbTimeout(
+            this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true }),
+            'historySync:messageCreateMany',
+          );
         }
 
         if (
@@ -2378,24 +2438,32 @@ export class BaileysStartupService extends ChannelStartupService {
                 ? Math.floor(received?.messageTimestamp.toNumber())
                 : Math.floor(received?.messageTimestamp as number);
 
-              await this.prismaRepository.message.update({
-                where: { id: (oldMessage as any).id },
-                data: {
-                  message: editedMessage.editedMessage as any,
-                  messageTimestamp: editedMessageTimestamp,
-                  status: 'EDITED',
-                },
-              });
-              await this.prismaRepository.messageUpdate.create({
-                data: {
-                  fromMe: editedMessage.key.fromMe,
-                  keyId: editedMessage.key.id,
-                  remoteJid: editedMessage.key.remoteJid,
-                  status: 'EDITED',
-                  instanceId: this.instanceId,
-                  messageId: (oldMessage as any).id,
-                },
-              });
+              // ✅ FIX 1: Wrap DB query with timeout
+              await withDbTimeout(
+                this.prismaRepository.message.update({
+                  where: { id: (oldMessage as any).id },
+                  data: {
+                    message: editedMessage.editedMessage as any,
+                    messageTimestamp: editedMessageTimestamp,
+                    status: 'EDITED',
+                  },
+                }),
+                'messagesUpsert:messageUpdate',
+              );
+              // ✅ FIX 1: Wrap DB query with timeout
+              await withDbTimeout(
+                this.prismaRepository.messageUpdate.create({
+                  data: {
+                    fromMe: editedMessage.key.fromMe,
+                    keyId: editedMessage.key.id,
+                    remoteJid: editedMessage.key.remoteJid,
+                    status: 'EDITED',
+                    instanceId: this.instanceId,
+                    messageId: (oldMessage as any).id,
+                  },
+                }),
+                'messagesUpsert:messageUpdateCreate',
+              );
             }
           }
 
@@ -2426,10 +2494,14 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
-          const existingChat = await this.prismaRepository.chat.findFirst({
-            where: { instanceId: this.instanceId, remoteJid: received.key.remoteJid },
-            select: { id: true, name: true },
-          });
+          // ✅ FIX 1: Wrap DB query with timeout
+          const existingChat = await withDbTimeout(
+            this.prismaRepository.chat.findFirst({
+              where: { instanceId: this.instanceId, remoteJid: received.key.remoteJid },
+              select: { id: true, name: true },
+            }),
+            'messagesUpsert:chatFindFirst',
+          );
 
           if (
             existingChat &&
@@ -2442,10 +2514,14 @@ export class BaileysStartupService extends ChannelStartupService {
             this.sendDataWebhook(Events.CHATS_UPSERT, [{ ...existingChat, name: received.pushName }]);
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
               try {
-                await this.prismaRepository.chat.update({
-                  where: { id: existingChat.id },
-                  data: { name: received.pushName },
-                });
+                // ✅ FIX 1: Wrap DB query with timeout
+                await withDbTimeout(
+                  this.prismaRepository.chat.update({
+                    where: { id: existingChat.id },
+                    data: { name: received.pushName },
+                  }),
+                  'messagesUpsert:chatUpdate',
+                );
               } catch {
                 console.log(`Chat insert record ignored: ${received.key.remoteJid} - ${this.instanceId}`);
               }
@@ -2492,10 +2568,14 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (this.configService.get<Openai>('OPENAI').ENABLED && received?.message?.audioMessage) {
-            const openAiDefaultSettings = await this.prismaRepository.openaiSetting.findFirst({
-              where: { instanceId: this.instanceId },
-              include: { OpenaiCreds: true },
-            });
+            // ✅ FIX 1: Wrap DB query with timeout
+            const openAiDefaultSettings = await withDbTimeout(
+              this.prismaRepository.openaiSetting.findFirst({
+                where: { instanceId: this.instanceId },
+                include: { OpenaiCreds: true },
+              }),
+              'messagesUpsert:openaiSettingFind',
+            );
 
             if (openAiDefaultSettings && openAiDefaultSettings.openaiCredsId && openAiDefaultSettings.speechToText) {
               messageRaw.message.speechToText = `[audio] ${await this.openaiService.speechToText(received, this)}`;
@@ -2503,7 +2583,11 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
-            const msg = await this.prismaRepository.message.create({ data: messageRaw });
+            // ✅ FIX 1: Wrap DB query with timeout
+            const msg = await withDbTimeout(
+              this.prismaRepository.message.create({ data: messageRaw }),
+              'messagesUpsert:messageCreate',
+            );
 
             const { remoteJid } = received.key;
             const timestamp = msg.messageTimestamp;
@@ -2561,21 +2645,29 @@ export class BaileysStartupService extends ChannelStartupService {
                     );
                     await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
 
-                    await this.prismaRepository.media.create({
-                      data: {
-                        messageId: msg.id,
-                        instanceId: this.instanceId,
-                        type: mediaType,
-                        fileName: fullName,
-                        mimetype,
-                      },
-                    });
+                    // ✅ FIX 1: Wrap DB query with timeout
+                    await withDbTimeout(
+                      this.prismaRepository.media.create({
+                        data: {
+                          messageId: msg.id,
+                          instanceId: this.instanceId,
+                          type: mediaType,
+                          fileName: fullName,
+                          mimetype,
+                        },
+                      }),
+                      'messagesUpsert:mediaCreate',
+                    );
 
                     const mediaUrl = await s3Service.getObjectUrl(fullName);
 
                     messageRaw.message.mediaUrl = mediaUrl;
 
-                    await this.prismaRepository.message.update({ where: { id: msg.id }, data: messageRaw });
+                    // ✅ FIX 1: Wrap DB query with timeout
+                    await withDbTimeout(
+                      this.prismaRepository.message.update({ where: { id: msg.id }, data: messageRaw }),
+                      'messagesUpsert:messageUpdate2',
+                    );
                   }
                 } catch (error) {
                   this.logger.error(['Error on upload file to minio', error?.message, error?.stack]);
@@ -2628,9 +2720,13 @@ export class BaileysStartupService extends ChannelStartupService {
             pushName: messageRaw.pushName,
           });
 
-          const contact = await this.prismaRepository.contact.findFirst({
-            where: { remoteJid: received.key.remoteJid, instanceId: this.instanceId },
-          });
+          // ✅ FIX 1: Wrap DB query with timeout
+          const contact = await withDbTimeout(
+            this.prismaRepository.contact.findFirst({
+              where: { remoteJid: received.key.remoteJid, instanceId: this.instanceId },
+            }),
+            'messagesUpsert:contactFindFirst',
+          );
 
           const contactRaw: {
             remoteJid: string;
@@ -2671,11 +2767,17 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-              await this.prismaRepository.contact.upsert({
-                where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
-                create: contactRaw,
-                update: contactRaw,
-              });
+              // ✅ FIX 1: Wrap DB query with timeout
+              await withDbTimeout(
+                this.prismaRepository.contact.upsert({
+                  where: {
+                    remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId },
+                  },
+                  create: contactRaw,
+                  update: contactRaw,
+                }),
+                'messagesUpsert:contactUpsert1',
+              );
 
             continue;
           }
@@ -2683,11 +2785,15 @@ export class BaileysStartupService extends ChannelStartupService {
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-            await this.prismaRepository.contact.upsert({
-              where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
-              update: contactRaw,
-              create: contactRaw,
-            });
+            // ✅ FIX 1: Wrap DB query with timeout
+            await withDbTimeout(
+              this.prismaRepository.contact.upsert({
+                where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
+                update: contactRaw,
+                create: contactRaw,
+              }),
+              'messagesUpsert:contactUpsert2',
+            );
         }
       } catch (error) {
         this.logger.error(error);
@@ -2754,13 +2860,17 @@ export class BaileysStartupService extends ChannelStartupService {
           let findMessage: any;
           const configDatabaseData = this.configService.get<Database>('DATABASE').SAVE_DATA;
           if (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE) {
+            // ✅ FIX 1: Wrap DB query with timeout
             // Use raw SQL to avoid JSON path issues
-            const messages = (await this.prismaRepository.$queryRaw`
-              SELECT * FROM "Message"
-              WHERE "instanceId" = ${this.instanceId}
-              AND "key"->>'id' = ${key.id}
-              LIMIT 1
-            `) as any[];
+            const messages = (await withDbTimeout(
+              this.prismaRepository.$queryRaw`
+                SELECT * FROM "Message"
+                WHERE "instanceId" = ${this.instanceId}
+                AND "key"->>'id' = ${key.id}
+                LIMIT 1
+              `,
+              'messagesUpdate:queryRaw',
+            )) as any[];
             findMessage = messages[0] || null;
 
             if (!findMessage?.id) {
@@ -2774,7 +2884,11 @@ export class BaileysStartupService extends ChannelStartupService {
             this.sendDataWebhook(Events.MESSAGES_DELETE, key);
 
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE)
-              await this.prismaRepository.messageUpdate.create({ data: message });
+              // ✅ FIX 1: Wrap DB query with timeout
+              await withDbTimeout(
+                this.prismaRepository.messageUpdate.create({ data: message }),
+                'messagesUpdate:messageUpdateCreate',
+              );
 
             if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
               this.chatwootService.eventWhatsapp(
@@ -2805,10 +2919,14 @@ export class BaileysStartupService extends ChannelStartupService {
                   await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
                 }
 
-                await this.prismaRepository.message.update({
-                  where: { id: findMessage.id },
-                  data: { status: status[update.status] },
-                });
+                // ✅ FIX 1: Wrap DB query with timeout
+                await withDbTimeout(
+                  this.prismaRepository.message.update({
+                    where: { id: findMessage.id },
+                    data: { status: status[update.status] },
+                  }),
+                  'messagesUpdate:messageUpdate',
+                );
               } else {
                 this.logger.info(
                   `Update readed messages duplicated ignored in message.update [avoid deadlock]: ${messageKey}`,
@@ -2820,11 +2938,19 @@ export class BaileysStartupService extends ChannelStartupService {
           this.sendDataWebhook(Events.MESSAGES_UPDATE, message);
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE)
-            await this.prismaRepository.messageUpdate.create({ data: message });
+            // ✅ FIX 1: Wrap DB query with timeout
+            await withDbTimeout(
+              this.prismaRepository.messageUpdate.create({ data: message }),
+              'messagesUpdate:messageUpdateCreate2',
+            );
 
-          const existingChat = await this.prismaRepository.chat.findFirst({
-            where: { instanceId: this.instanceId, remoteJid: message.remoteJid },
-          });
+          // ✅ FIX 1: Wrap DB query with timeout
+          const existingChat = await withDbTimeout(
+            this.prismaRepository.chat.findFirst({
+              where: { instanceId: this.instanceId, remoteJid: message.remoteJid },
+            }),
+            'messagesUpdate:chatFindFirst',
+          );
 
           if (existingChat) {
             const chatToInsert = { remoteJid: message.remoteJid, instanceId: this.instanceId, unreadMessages: 0 };
@@ -2832,7 +2958,11 @@ export class BaileysStartupService extends ChannelStartupService {
             this.sendDataWebhook(Events.CHATS_UPSERT, [chatToInsert]);
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
               try {
-                await this.prismaRepository.chat.update({ where: { id: existingChat.id }, data: chatToInsert });
+                // ✅ FIX 1: Wrap DB query with timeout
+                await withDbTimeout(
+                  this.prismaRepository.chat.update({ where: { id: existingChat.id }, data: chatToInsert }),
+                  'messagesUpdate:chatUpdate',
+                );
               } catch {
                 console.log(`Chat insert record ignored: ${chatToInsert.remoteJid} - ${chatToInsert.instanceId}`);
               }
@@ -2929,13 +3059,21 @@ export class BaileysStartupService extends ChannelStartupService {
     [Events.LABELS_EDIT]: async (label: Label) => {
       this.sendDataWebhook(Events.LABELS_EDIT, { ...label, instance: this.instance.name });
 
-      const labelsRepository = await this.prismaRepository.label.findMany({ where: { instanceId: this.instanceId } });
+      // ✅ FIX 1: Wrap DB query with timeout
+      const labelsRepository = await withDbTimeout(
+        this.prismaRepository.label.findMany({ where: { instanceId: this.instanceId } }),
+        'labelHandle:findMany',
+      );
 
       const savedLabel = labelsRepository.find((l) => l.labelId === label.id);
       if (label.deleted && savedLabel) {
-        await this.prismaRepository.label.delete({
-          where: { labelId_instanceId: { instanceId: this.instanceId, labelId: label.id } },
-        });
+        // ✅ FIX 1: Wrap DB query with timeout
+        await withDbTimeout(
+          this.prismaRepository.label.delete({
+            where: { labelId_instanceId: { instanceId: this.instanceId, labelId: label.id } },
+          }),
+          'labelHandle:delete',
+        );
         this.sendDataWebhook(Events.LABELS_EDIT, { ...label, instance: this.instance.name });
         return;
       }
@@ -2950,11 +3088,15 @@ export class BaileysStartupService extends ChannelStartupService {
             predefinedId: label.predefinedId,
             instanceId: this.instanceId,
           };
-          await this.prismaRepository.label.upsert({
-            where: { labelId_instanceId: { instanceId: labelData.instanceId, labelId: labelData.labelId } },
-            update: labelData,
-            create: labelData,
-          });
+          // ✅ FIX 1: Wrap DB query with timeout
+          await withDbTimeout(
+            this.prismaRepository.label.upsert({
+              where: { labelId_instanceId: { instanceId: labelData.instanceId, labelId: labelData.labelId } },
+              update: labelData,
+              create: labelData,
+            }),
+            'labelHandle:upsert',
+          );
         }
       }
     },
@@ -3136,9 +3278,11 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       if (msg.progress === 100) {
-        setTimeout(() => {
+        const chatwootImportTimer = setTimeout(() => {
           this.chatwootService.importHistoryMessages(instance);
         }, 10000);
+        // ✅ FIX 2: Register timer to prevent memory leak
+        this.resourceRegistry.addTimer(chatwootImportTimer, 'chatwootImportTimer');
       }
     }
 
