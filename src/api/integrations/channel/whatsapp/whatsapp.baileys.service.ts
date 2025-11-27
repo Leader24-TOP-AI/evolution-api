@@ -696,8 +696,9 @@ export class BaileysStartupService extends ChannelStartupService {
       this.lastConnectionState = 'close';
 
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      // ✅ FIX: Aggiunto 440 (session replaced) per evitare retry infinito con auth invalido
-      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406, 440];
+      // ✅ FIX: Aggiunto 440 (session replaced) e 408 (timeout) per evitare retry infinito
+      // 408 = Request Timeout - riconnettersi immediatamente causa loop infinito per nuove istanze
+      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406, 408, 440];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
 
       if (shouldReconnect) {
