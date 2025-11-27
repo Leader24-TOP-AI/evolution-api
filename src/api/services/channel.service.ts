@@ -13,6 +13,7 @@ import { Auth, Chatwoot, ConfigService, HttpServer, Proxy } from '@config/env.co
 import { Logger } from '@config/logger.config';
 import { NotFoundException } from '@exceptions';
 import { Contact, Message, Prisma } from '@prisma/client';
+import { withDbTimeout } from '@utils/async-timeout';
 import { createJid } from '@utils/createJid';
 import { WASocket } from 'baileys';
 import { isArray } from 'class-validator';
@@ -131,22 +132,30 @@ export class ChannelStartupService {
   }
 
   public async loadWebhook() {
-    const data = await this.prismaRepository.webhook.findUnique({
-      where: {
-        instanceId: this.instanceId,
-      },
-    });
+    // ✅ FIX: Wrap DB query with timeout
+    const data = await withDbTimeout(
+      this.prismaRepository.webhook.findUnique({
+        where: {
+          instanceId: this.instanceId,
+        },
+      }),
+      'channel:loadWebhook',
+    );
 
     this.localWebhook.enabled = data?.enabled;
     this.localWebhook.webhookBase64 = data?.webhookBase64;
   }
 
   public async loadSettings() {
-    const data = await this.prismaRepository.setting.findUnique({
-      where: {
-        instanceId: this.instanceId,
-      },
-    });
+    // ✅ FIX: Wrap DB query with timeout
+    const data = await withDbTimeout(
+      this.prismaRepository.setting.findUnique({
+        where: {
+          instanceId: this.instanceId,
+        },
+      }),
+      'channel:loadSettings',
+    );
 
     this.localSettings.rejectCall = data?.rejectCall;
     this.localSettings.msgCall = data?.msgCall;
@@ -159,32 +168,36 @@ export class ChannelStartupService {
   }
 
   public async setSettings(data: SettingsDto) {
-    await this.prismaRepository.setting.upsert({
-      where: {
-        instanceId: this.instanceId,
-      },
-      update: {
-        rejectCall: data.rejectCall,
-        msgCall: data.msgCall,
-        groupsIgnore: data.groupsIgnore,
-        alwaysOnline: data.alwaysOnline,
-        readMessages: data.readMessages,
-        readStatus: data.readStatus,
-        syncFullHistory: data.syncFullHistory,
-        wavoipToken: data.wavoipToken,
-      },
-      create: {
-        rejectCall: data.rejectCall,
-        msgCall: data.msgCall,
-        groupsIgnore: data.groupsIgnore,
-        alwaysOnline: data.alwaysOnline,
-        readMessages: data.readMessages,
-        readStatus: data.readStatus,
-        syncFullHistory: data.syncFullHistory,
-        wavoipToken: data.wavoipToken,
-        instanceId: this.instanceId,
-      },
-    });
+    // ✅ FIX: Wrap DB query with timeout
+    await withDbTimeout(
+      this.prismaRepository.setting.upsert({
+        where: {
+          instanceId: this.instanceId,
+        },
+        update: {
+          rejectCall: data.rejectCall,
+          msgCall: data.msgCall,
+          groupsIgnore: data.groupsIgnore,
+          alwaysOnline: data.alwaysOnline,
+          readMessages: data.readMessages,
+          readStatus: data.readStatus,
+          syncFullHistory: data.syncFullHistory,
+          wavoipToken: data.wavoipToken,
+        },
+        create: {
+          rejectCall: data.rejectCall,
+          msgCall: data.msgCall,
+          groupsIgnore: data.groupsIgnore,
+          alwaysOnline: data.alwaysOnline,
+          readMessages: data.readMessages,
+          readStatus: data.readStatus,
+          syncFullHistory: data.syncFullHistory,
+          wavoipToken: data.wavoipToken,
+          instanceId: this.instanceId,
+        },
+      }),
+      'channel:setSettings',
+    );
 
     this.localSettings.rejectCall = data?.rejectCall;
     this.localSettings.msgCall = data?.msgCall;
@@ -202,11 +215,15 @@ export class ChannelStartupService {
   }
 
   public async findSettings() {
-    const data = await this.prismaRepository.setting.findUnique({
-      where: {
-        instanceId: this.instanceId,
-      },
-    });
+    // ✅ FIX: Wrap DB query with timeout
+    const data = await withDbTimeout(
+      this.prismaRepository.setting.findUnique({
+        where: {
+          instanceId: this.instanceId,
+        },
+      }),
+      'channel:findSettings',
+    );
 
     if (!data) {
       return null;
@@ -229,11 +246,15 @@ export class ChannelStartupService {
       return;
     }
 
-    const data = await this.prismaRepository.chatwoot.findUnique({
-      where: {
-        instanceId: this.instanceId,
-      },
-    });
+    // ✅ FIX: Wrap DB query with timeout
+    const data = await withDbTimeout(
+      this.prismaRepository.chatwoot.findUnique({
+        where: {
+          instanceId: this.instanceId,
+        },
+      }),
+      'channel:loadChatwoot',
+    );
 
     this.localChatwoot.enabled = data?.enabled;
     this.localChatwoot.accountId = data?.accountId;
@@ -256,17 +277,55 @@ export class ChannelStartupService {
       return;
     }
 
-    const chatwoot = await this.prismaRepository.chatwoot.findUnique({
-      where: {
-        instanceId: this.instanceId,
-      },
-    });
-
-    if (chatwoot) {
-      await this.prismaRepository.chatwoot.update({
+    // ✅ FIX: Wrap DB query with timeout
+    const chatwoot = await withDbTimeout(
+      this.prismaRepository.chatwoot.findUnique({
         where: {
           instanceId: this.instanceId,
         },
+      }),
+      'channel:setChatwoot:find',
+    );
+
+    if (chatwoot) {
+      // ✅ FIX: Wrap DB query with timeout
+      await withDbTimeout(
+        this.prismaRepository.chatwoot.update({
+          where: {
+            instanceId: this.instanceId,
+          },
+          data: {
+            enabled: data?.enabled,
+            accountId: data.accountId,
+            token: data.token,
+            url: data.url,
+            nameInbox: data.nameInbox,
+            signMsg: data.signMsg,
+            signDelimiter: data.signMsg ? data.signDelimiter : null,
+            number: data.number,
+            reopenConversation: data.reopenConversation,
+            conversationPending: data.conversationPending,
+            mergeBrazilContacts: data.mergeBrazilContacts,
+            importContacts: data.importContacts,
+            importMessages: data.importMessages,
+            daysLimitImportMessages: data.daysLimitImportMessages,
+            organization: data.organization,
+            logo: data.logo,
+            ignoreJids: data.ignoreJids,
+          },
+        }),
+        'channel:setChatwoot:update',
+      );
+
+      Object.assign(this.localChatwoot, { ...data, signDelimiter: data.signMsg ? data.signDelimiter : null });
+
+      this.clearCacheChatwoot();
+      return;
+    }
+
+    // ✅ FIX: Wrap DB query with timeout
+    await withDbTimeout(
+      this.prismaRepository.chatwoot.create({
         data: {
           enabled: data?.enabled,
           accountId: data.accountId,
@@ -274,7 +333,6 @@ export class ChannelStartupService {
           url: data.url,
           nameInbox: data.nameInbox,
           signMsg: data.signMsg,
-          signDelimiter: data.signMsg ? data.signDelimiter : null,
           number: data.number,
           reopenConversation: data.reopenConversation,
           conversationPending: data.conversationPending,
@@ -285,36 +343,11 @@ export class ChannelStartupService {
           organization: data.organization,
           logo: data.logo,
           ignoreJids: data.ignoreJids,
+          instanceId: this.instanceId,
         },
-      });
-
-      Object.assign(this.localChatwoot, { ...data, signDelimiter: data.signMsg ? data.signDelimiter : null });
-
-      this.clearCacheChatwoot();
-      return;
-    }
-
-    await this.prismaRepository.chatwoot.create({
-      data: {
-        enabled: data?.enabled,
-        accountId: data.accountId,
-        token: data.token,
-        url: data.url,
-        nameInbox: data.nameInbox,
-        signMsg: data.signMsg,
-        number: data.number,
-        reopenConversation: data.reopenConversation,
-        conversationPending: data.conversationPending,
-        mergeBrazilContacts: data.mergeBrazilContacts,
-        importContacts: data.importContacts,
-        importMessages: data.importMessages,
-        daysLimitImportMessages: data.daysLimitImportMessages,
-        organization: data.organization,
-        logo: data.logo,
-        ignoreJids: data.ignoreJids,
-        instanceId: this.instanceId,
-      },
-    });
+      }),
+      'channel:setChatwoot:create',
+    );
 
     Object.assign(this.localChatwoot, { ...data, signDelimiter: data.signMsg ? data.signDelimiter : null });
 
@@ -326,11 +359,15 @@ export class ChannelStartupService {
       return null;
     }
 
-    const data = await this.prismaRepository.chatwoot.findUnique({
-      where: {
-        instanceId: this.instanceId,
-      },
-    });
+    // ✅ FIX: Wrap DB query with timeout
+    const data = await withDbTimeout(
+      this.prismaRepository.chatwoot.findUnique({
+        where: {
+          instanceId: this.instanceId,
+        },
+      }),
+      'channel:findChatwoot',
+    );
 
     if (!data) {
       return null;
@@ -388,11 +425,15 @@ export class ChannelStartupService {
         this.localProxy.password = proxyConfig.PASSWORD;
       }
 
-      const data = await this.prismaRepository.proxy.findUnique({
-        where: {
-          instanceId: this.instanceId,
-        },
-      });
+      // ✅ FIX: Wrap DB query with timeout
+      const data = await withDbTimeout(
+        this.prismaRepository.proxy.findUnique({
+          where: {
+            instanceId: this.instanceId,
+          },
+        }),
+        'channel:loadProxy',
+      );
 
       if (data?.enabled) {
         this.localProxy.enabled = true;
@@ -408,38 +449,46 @@ export class ChannelStartupService {
   }
 
   public async setProxy(data: ProxyDto) {
-    await this.prismaRepository.proxy.upsert({
-      where: {
-        instanceId: this.instanceId,
-      },
-      update: {
-        enabled: data?.enabled,
-        host: data.host,
-        port: data.port,
-        protocol: data.protocol,
-        username: data.username,
-        password: data.password,
-      },
-      create: {
-        enabled: data?.enabled,
-        host: data.host,
-        port: data.port,
-        protocol: data.protocol,
-        username: data.username,
-        password: data.password,
-        instanceId: this.instanceId,
-      },
-    });
+    // ✅ FIX: Wrap DB query with timeout
+    await withDbTimeout(
+      this.prismaRepository.proxy.upsert({
+        where: {
+          instanceId: this.instanceId,
+        },
+        update: {
+          enabled: data?.enabled,
+          host: data.host,
+          port: data.port,
+          protocol: data.protocol,
+          username: data.username,
+          password: data.password,
+        },
+        create: {
+          enabled: data?.enabled,
+          host: data.host,
+          port: data.port,
+          protocol: data.protocol,
+          username: data.username,
+          password: data.password,
+          instanceId: this.instanceId,
+        },
+      }),
+      'channel:setProxy',
+    );
 
     Object.assign(this.localProxy, data);
   }
 
   public async findProxy() {
-    const data = await this.prismaRepository.proxy.findUnique({
-      where: {
-        instanceId: this.instanceId,
-      },
-    });
+    // ✅ FIX: Wrap DB query with timeout
+    const data = await withDbTimeout(
+      this.prismaRepository.proxy.findUnique({
+        where: {
+          instanceId: this.instanceId,
+        },
+      }),
+      'channel:findProxy',
+    );
 
     if (!data) {
       throw new NotFoundException('Proxy not found');
@@ -531,7 +580,11 @@ export class ChannelStartupService {
       contactFindManyArgs.skip = query.offset * (validPage - 1);
     }
 
-    const contacts = await this.prismaRepository.contact.findMany(contactFindManyArgs);
+    // ✅ FIX: Wrap DB query with timeout
+    const contacts = await withDbTimeout(
+      this.prismaRepository.contact.findMany(contactFindManyArgs),
+      'channel:fetchContacts',
+    );
 
     return contacts.map((contact) => {
       const remoteJid = contact.remoteJid;
@@ -623,21 +676,25 @@ export class ChannelStartupService {
       }
     }
 
-    const count = await this.prismaRepository.message.count({
-      where: {
-        instanceId: this.instanceId,
-        id: query?.where?.id,
-        source: query?.where?.source,
-        messageType: query?.where?.messageType,
-        ...timestampFilter,
-        AND: [
-          keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-          keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
-        ],
-      },
-    });
+    // ✅ FIX: Wrap DB query with timeout
+    const count = await withDbTimeout(
+      this.prismaRepository.message.count({
+        where: {
+          instanceId: this.instanceId,
+          id: query?.where?.id,
+          source: query?.where?.source,
+          messageType: query?.where?.messageType,
+          ...timestampFilter,
+          AND: [
+            keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
+            keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
+            keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
+            keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
+          ],
+        },
+      }),
+      'channel:fetchMessages:count',
+    );
 
     if (!query?.offset) {
       query.offset = 50;
@@ -647,42 +704,46 @@ export class ChannelStartupService {
       query.page = 1;
     }
 
-    const messages = await this.prismaRepository.message.findMany({
-      where: {
-        instanceId: this.instanceId,
-        id: query?.where?.id,
-        source: query?.where?.source,
-        messageType: query?.where?.messageType,
-        ...timestampFilter,
-        AND: [
-          keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-          keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
-        ],
-      },
-      orderBy: {
-        messageTimestamp: 'desc',
-      },
-      skip: query.offset * (query?.page === 1 ? 0 : (query?.page as number) - 1),
-      take: query.offset,
-      select: {
-        id: true,
-        key: true,
-        pushName: true,
-        messageType: true,
-        message: true,
-        messageTimestamp: true,
-        instanceId: true,
-        source: true,
-        contextInfo: true,
-        MessageUpdate: {
-          select: {
-            status: true,
+    // ✅ FIX: Wrap DB query with timeout
+    const messages = await withDbTimeout(
+      this.prismaRepository.message.findMany({
+        where: {
+          instanceId: this.instanceId,
+          id: query?.where?.id,
+          source: query?.where?.source,
+          messageType: query?.where?.messageType,
+          ...timestampFilter,
+          AND: [
+            keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
+            keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
+            keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
+            keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
+          ],
+        },
+        orderBy: {
+          messageTimestamp: 'desc',
+        },
+        skip: query.offset * (query?.page === 1 ? 0 : (query?.page as number) - 1),
+        take: query.offset,
+        select: {
+          id: true,
+          key: true,
+          pushName: true,
+          messageType: true,
+          message: true,
+          messageTimestamp: true,
+          instanceId: true,
+          source: true,
+          contextInfo: true,
+          MessageUpdate: {
+            select: {
+              status: true,
+            },
           },
         },
-      },
-    });
+      }),
+      'channel:fetchMessages:findMany',
+    );
 
     return {
       messages: {
@@ -703,25 +764,33 @@ export class ChannelStartupService {
       query.page = 1;
     }
 
-    return await this.prismaRepository.messageUpdate.findMany({
-      where: {
-        instanceId: this.instanceId,
-        remoteJid: query.where?.remoteJid,
-        keyId: query.where?.id,
-      },
-      skip: query.offset * (query?.page === 1 ? 0 : (query?.page as number) - 1),
-      take: query.offset,
-    });
+    // ✅ FIX: Wrap DB query with timeout
+    return await withDbTimeout(
+      this.prismaRepository.messageUpdate.findMany({
+        where: {
+          instanceId: this.instanceId,
+          remoteJid: query.where?.remoteJid,
+          keyId: query.where?.id,
+        },
+        skip: query.offset * (query?.page === 1 ? 0 : (query?.page as number) - 1),
+        take: query.offset,
+      }),
+      'channel:fetchStatusMessage',
+    );
   }
 
   public async findChatByRemoteJid(remoteJid: string) {
     if (!remoteJid) return null;
-    return await this.prismaRepository.chat.findFirst({
-      where: {
-        instanceId: this.instanceId,
-        remoteJid: remoteJid,
-      },
-    });
+    // ✅ FIX: Wrap DB query with timeout
+    return await withDbTimeout(
+      this.prismaRepository.chat.findFirst({
+        where: {
+          instanceId: this.instanceId,
+          remoteJid: remoteJid,
+        },
+      }),
+      'channel:findChatByRemoteJid',
+    );
   }
 
   public async fetchChats(query: any) {
@@ -749,18 +818,20 @@ export class ChannelStartupService {
     const limit = query?.take ? Prisma.sql`LIMIT ${query.take}` : Prisma.sql``;
     const offset = query?.skip ? Prisma.sql`OFFSET ${query.skip}` : Prisma.sql``;
 
-    const results = await this.prismaRepository.$queryRaw`
+    // ✅ FIX: Wrap DB query with timeout
+    const results = await withDbTimeout(
+      this.prismaRepository.$queryRaw`
       WITH rankedMessages AS (
-        SELECT DISTINCT ON ("Message"."key"->>'remoteJid') 
+        SELECT DISTINCT ON ("Message"."key"->>'remoteJid')
           "Contact"."id" as "contactId",
           "Message"."key"->>'remoteJid' as "remoteJid",
-          CASE 
+          CASE
             WHEN "Message"."key"->>'remoteJid' LIKE '%@g.us' THEN COALESCE("Chat"."name", "Contact"."pushName")
             ELSE COALESCE("Contact"."pushName", "Message"."pushName")
           END as "pushName",
           "Contact"."profilePicUrl",
           COALESCE(
-            to_timestamp("Message"."messageTimestamp"::double precision), 
+            to_timestamp("Message"."messageTimestamp"::double precision),
             "Contact"."updatedAt"
           ) as "updatedAt",
           "Chat"."name" as "pushName",
@@ -791,11 +862,13 @@ export class ChannelStartupService {
         ${timestampFilter}
         ORDER BY "Message"."key"->>'remoteJid', "Message"."messageTimestamp" DESC
       )
-      SELECT * FROM rankedMessages 
+      SELECT * FROM rankedMessages
       ORDER BY "updatedAt" DESC NULLS LAST
       ${limit}
       ${offset};
-    `;
+    `,
+      'channel:fetchChats',
+    );
 
     if (results && isArray(results) && results.length > 0) {
       const mappedResults = results.map((contact) => {

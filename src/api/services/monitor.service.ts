@@ -200,34 +200,90 @@ export class WAMonitoringService {
       execFileSync('rm', ['-rf', instancePath]);
     }
 
-    const instance = await this.prismaRepository.instance.findFirst({
-      where: { name: instanceName },
-    });
+    // ✅ FIX: Wrap DB query with timeout
+    const instance = await withDbTimeout(
+      this.prismaRepository.instance.findFirst({
+        where: { name: instanceName },
+      }),
+      'monitor:cleaningStoreData:findInstance',
+    );
 
     if (!instance) return;
 
     rmSync(join(INSTANCE_DIR, instance.id), { recursive: true, force: true });
 
-    await this.prismaRepository.session.deleteMany({ where: { sessionId: instance.id } });
+    // ✅ FIX: Wrap all DELETE queries with timeout to prevent hanging
+    await withDbTimeout(
+      this.prismaRepository.session.deleteMany({ where: { sessionId: instance.id } }),
+      'monitor:cleaningStoreData:deleteSession',
+    );
 
-    await this.prismaRepository.chat.deleteMany({ where: { instanceId: instance.id } });
-    await this.prismaRepository.contact.deleteMany({ where: { instanceId: instance.id } });
-    await this.prismaRepository.messageUpdate.deleteMany({ where: { instanceId: instance.id } });
-    await this.prismaRepository.message.deleteMany({ where: { instanceId: instance.id } });
+    await withDbTimeout(
+      this.prismaRepository.chat.deleteMany({ where: { instanceId: instance.id } }),
+      'monitor:cleaningStoreData:deleteChat',
+    );
+    await withDbTimeout(
+      this.prismaRepository.contact.deleteMany({ where: { instanceId: instance.id } }),
+      'monitor:cleaningStoreData:deleteContact',
+    );
+    await withDbTimeout(
+      this.prismaRepository.messageUpdate.deleteMany({ where: { instanceId: instance.id } }),
+      'monitor:cleaningStoreData:deleteMessageUpdate',
+    );
+    await withDbTimeout(
+      this.prismaRepository.message.deleteMany({ where: { instanceId: instance.id } }),
+      'monitor:cleaningStoreData:deleteMessage',
+    );
 
-    await this.prismaRepository.webhook.deleteMany({ where: { instanceId: instance.id } });
-    await this.prismaRepository.chatwoot.deleteMany({ where: { instanceId: instance.id } });
-    await this.prismaRepository.proxy.deleteMany({ where: { instanceId: instance.id } });
-    await this.prismaRepository.rabbitmq.deleteMany({ where: { instanceId: instance.id } });
-    await this.prismaRepository.nats.deleteMany({ where: { instanceId: instance.id } });
-    await this.prismaRepository.sqs.deleteMany({ where: { instanceId: instance.id } });
-    await this.prismaRepository.integrationSession.deleteMany({ where: { instanceId: instance.id } });
-    await this.prismaRepository.typebot.deleteMany({ where: { instanceId: instance.id } });
-    await this.prismaRepository.websocket.deleteMany({ where: { instanceId: instance.id } });
-    await this.prismaRepository.setting.deleteMany({ where: { instanceId: instance.id } });
-    await this.prismaRepository.label.deleteMany({ where: { instanceId: instance.id } });
+    await withDbTimeout(
+      this.prismaRepository.webhook.deleteMany({ where: { instanceId: instance.id } }),
+      'monitor:cleaningStoreData:deleteWebhook',
+    );
+    await withDbTimeout(
+      this.prismaRepository.chatwoot.deleteMany({ where: { instanceId: instance.id } }),
+      'monitor:cleaningStoreData:deleteChatwoot',
+    );
+    await withDbTimeout(
+      this.prismaRepository.proxy.deleteMany({ where: { instanceId: instance.id } }),
+      'monitor:cleaningStoreData:deleteProxy',
+    );
+    await withDbTimeout(
+      this.prismaRepository.rabbitmq.deleteMany({ where: { instanceId: instance.id } }),
+      'monitor:cleaningStoreData:deleteRabbitmq',
+    );
+    await withDbTimeout(
+      this.prismaRepository.nats.deleteMany({ where: { instanceId: instance.id } }),
+      'monitor:cleaningStoreData:deleteNats',
+    );
+    await withDbTimeout(
+      this.prismaRepository.sqs.deleteMany({ where: { instanceId: instance.id } }),
+      'monitor:cleaningStoreData:deleteSqs',
+    );
+    await withDbTimeout(
+      this.prismaRepository.integrationSession.deleteMany({ where: { instanceId: instance.id } }),
+      'monitor:cleaningStoreData:deleteIntegrationSession',
+    );
+    await withDbTimeout(
+      this.prismaRepository.typebot.deleteMany({ where: { instanceId: instance.id } }),
+      'monitor:cleaningStoreData:deleteTypebot',
+    );
+    await withDbTimeout(
+      this.prismaRepository.websocket.deleteMany({ where: { instanceId: instance.id } }),
+      'monitor:cleaningStoreData:deleteWebsocket',
+    );
+    await withDbTimeout(
+      this.prismaRepository.setting.deleteMany({ where: { instanceId: instance.id } }),
+      'monitor:cleaningStoreData:deleteSetting',
+    );
+    await withDbTimeout(
+      this.prismaRepository.label.deleteMany({ where: { instanceId: instance.id } }),
+      'monitor:cleaningStoreData:deleteLabel',
+    );
 
-    await this.prismaRepository.instance.delete({ where: { name: instanceName } });
+    await withDbTimeout(
+      this.prismaRepository.instance.delete({ where: { name: instanceName } }),
+      'monitor:cleaningStoreData:deleteInstance',
+    );
   }
 
   public async loadInstance() {
@@ -247,22 +303,25 @@ export class WAMonitoringService {
   public async saveInstance(data: any) {
     try {
       const clientName = await this.configService.get<Database>('DATABASE').CONNECTION.CLIENT_NAME;
-      await this.prismaRepository.instance.create({
-        data: {
-          id: data.instanceId,
-          name: data.instanceName,
-          ownerJid: data.ownerJid,
-          profileName: data.profileName,
-          profilePicUrl: data.profilePicUrl,
-          connectionStatus:
-            data.integration && data.integration === Integration.WHATSAPP_BAILEYS ? 'close' : (data.status ?? 'open'),
-          number: data.number,
-          integration: data.integration || Integration.WHATSAPP_BAILEYS,
-          token: data.hash,
-          clientName: clientName,
-          businessId: data.businessId,
-        },
-      });
+      await withDbTimeout(
+        this.prismaRepository.instance.create({
+          data: {
+            id: data.instanceId,
+            name: data.instanceName,
+            ownerJid: data.ownerJid,
+            profileName: data.profileName,
+            profilePicUrl: data.profilePicUrl,
+            connectionStatus:
+              data.integration && data.integration === Integration.WHATSAPP_BAILEYS ? 'close' : (data.status ?? 'open'),
+            number: data.number,
+            integration: data.integration || Integration.WHATSAPP_BAILEYS,
+            token: data.hash,
+            clientName: clientName,
+            businessId: data.businessId,
+          },
+        }),
+        'monitor:saveInstance:createInstance',
+      );
     } catch (error) {
       this.logger.error(error);
     }

@@ -274,21 +274,26 @@ export class ResourceRegistry {
   addProcess(process: ChildProcess, description: string): void {
     if (this.isCleaningUp) return;
 
-    this.childProcesses.add({
+    const trackedProcess = {
       process,
       description,
       addedAt: Date.now(),
       pid: process.pid,
-    });
+    };
+
+    this.childProcesses.add(trackedProcess);
+
+    // ✅ FIX: Race condition fix - use flag to prevent double-remove
+    let removed = false;
+    const safeRemove = () => {
+      if (removed) return;
+      removed = true;
+      this.childProcesses.delete(trackedProcess);
+    };
 
     // Auto-remove when process exits
-    process.once('exit', () => {
-      this.removeProcess(process);
-    });
-
-    process.once('error', () => {
-      this.removeProcess(process);
-    });
+    process.once('exit', safeRemove);
+    process.once('error', safeRemove);
   }
 
   /**
