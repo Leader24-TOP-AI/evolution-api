@@ -7,6 +7,7 @@ import { CacheConf, Chatwoot, ConfigService, Database, DelInstance, ProviderSess
 import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR, STORE_DIR } from '@config/path.config';
 import { NotFoundException } from '@exceptions';
+import { withDbTimeout } from '@utils/async-timeout';
 import { execFileSync } from 'child_process';
 import EventEmitter2 from 'eventemitter2';
 import { rmSync } from 'fs';
@@ -87,25 +88,28 @@ export class WAMonitoringService {
           }
         : { clientName };
 
-    const instances = await this.prismaRepository.instance.findMany({
-      where,
-      include: {
-        Chatwoot: true,
-        Proxy: true,
-        Rabbitmq: true,
-        Nats: true,
-        Sqs: true,
-        Websocket: true,
-        Setting: true,
-        _count: {
-          select: {
-            Message: true,
-            Contact: true,
-            Chat: true,
+    const instances = await withDbTimeout(
+      this.prismaRepository.instance.findMany({
+        where,
+        include: {
+          Chatwoot: true,
+          Proxy: true,
+          Rabbitmq: true,
+          Nats: true,
+          Sqs: true,
+          Websocket: true,
+          Setting: true,
+          _count: {
+            select: {
+              Message: true,
+              Contact: true,
+              Chat: true,
+            },
           },
         },
-      },
-    });
+      }),
+      'monitor:instanceInfo:findInstances',
+    );
 
     return instances;
   }
@@ -113,12 +117,20 @@ export class WAMonitoringService {
   public async instanceInfoById(instanceId?: string, number?: string) {
     let instanceName: string;
     if (instanceId) {
-      instanceName = await this.prismaRepository.instance.findFirst({ where: { id: instanceId } }).then((r) => r?.name);
+      const instance = await withDbTimeout(
+        this.prismaRepository.instance.findFirst({ where: { id: instanceId } }),
+        'monitor:instanceInfoById:findById',
+      );
+      instanceName = instance?.name;
       if (!instanceName) {
         throw new NotFoundException(`Instance "${instanceId}" not found`);
       }
     } else if (number) {
-      instanceName = await this.prismaRepository.instance.findFirst({ where: { number } }).then((r) => r?.name);
+      const instance = await withDbTimeout(
+        this.prismaRepository.instance.findFirst({ where: { number } }),
+        'monitor:instanceInfoById:findByNumber',
+      );
+      instanceName = instance?.name;
       if (!instanceName) {
         throw new NotFoundException(`Instance "${number}" not found`);
       }
@@ -140,24 +152,33 @@ export class WAMonitoringService {
   public async cleaningUp(instanceName: string) {
     let instanceDbId: string;
     if (this.db.SAVE_DATA.INSTANCE) {
-      const findInstance = await this.prismaRepository.instance.findFirst({
-        where: { name: instanceName },
-      });
+      const findInstance = await withDbTimeout(
+        this.prismaRepository.instance.findFirst({
+          where: { name: instanceName },
+        }),
+        'monitor:cleaningUp:findInstance',
+      );
 
       if (findInstance) {
         // ✅ FIX: Setta definitiveLogout = true per prevenire auto-reload
-        const instance = await this.prismaRepository.instance.update({
-          where: { name: instanceName },
-          data: {
-            connectionStatus: 'close',
-            definitiveLogout: true, // ← Previene auto-reload dopo logout/forbidden/ban
-          },
-        });
+        const instance = await withDbTimeout(
+          this.prismaRepository.instance.update({
+            where: { name: instanceName },
+            data: {
+              connectionStatus: 'close',
+              definitiveLogout: true, // ← Previene auto-reload dopo logout/forbidden/ban
+            },
+          }),
+          'monitor:cleaningUp:updateInstance',
+        );
 
         rmSync(join(INSTANCE_DIR, instance.id), { recursive: true, force: true });
 
         instanceDbId = instance.id;
-        await this.prismaRepository.session.deleteMany({ where: { sessionId: instance.id } });
+        await withDbTimeout(
+          this.prismaRepository.session.deleteMany({ where: { sessionId: instance.id } }),
+          'monitor:cleaningUp:deleteSessions',
+        );
       }
     }
 
@@ -288,9 +309,12 @@ export class WAMonitoringService {
     if (keys?.length > 0) {
       await Promise.all(
         keys.map(async (k) => {
-          const instanceData = await this.prismaRepository.instance.findUnique({
-            where: { id: k.split(':')[1] },
-          });
+          const instanceData = await withDbTimeout(
+            this.prismaRepository.instance.findUnique({
+              where: { id: k.split(':')[1] },
+            }),
+            'monitor:loadInstancesFromRedis:findInstance',
+          );
 
           if (!instanceData) {
             return;
@@ -316,12 +340,15 @@ export class WAMonitoringService {
 
     // ✅ FIX: Escludi istanze con logout definitivo (401, 403, 402, 406)
     // Previene auto-reload e generazione QR code per istanze bannate/logout
-    const instances = await this.prismaRepository.instance.findMany({
-      where: {
-        clientName: clientName,
-        definitiveLogout: false, // ← Filtra istanze con close definitivo
-      },
-    });
+    const instances = await withDbTimeout(
+      this.prismaRepository.instance.findMany({
+        where: {
+          clientName: clientName,
+          definitiveLogout: false, // ← Filtra istanze con close definitivo
+        },
+      }),
+      'monitor:loadInstancesFromDB:findInstances',
+    );
 
     if (instances.length === 0) {
       return;
@@ -350,9 +377,12 @@ export class WAMonitoringService {
 
     await Promise.all(
       instances?.data?.map(async (instanceId: string) => {
-        const instance = await this.prismaRepository.instance.findUnique({
-          where: { id: instanceId },
-        });
+        const instance = await withDbTimeout(
+          this.prismaRepository.instance.findUnique({
+            where: { id: instanceId },
+          }),
+          'monitor:loadInstancesFromProvider:findInstance',
+        );
 
         this.setInstance({
           instanceId: instance.id,

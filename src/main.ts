@@ -163,6 +163,55 @@ async function bootstrap() {
   initWA();
 
   onUnexpectedError();
+
+  // ✅ FIX 8: Graceful shutdown handler per SIGTERM/SIGINT
+  const gracefulShutdown = async (signal: string) => {
+    logger.info(`${signal} received, initiating graceful shutdown...`);
+
+    // Stop accettare nuove richieste
+    server.close(() => {
+      logger.info('HTTP server closed');
+    });
+
+    // Chiudere istanze WhatsApp con timeout
+    const shutdownTimeout = 30000; // 30 secondi max per shutdown
+    const shutdownStart = Date.now();
+
+    try {
+      const instanceNames = Object.keys(waMonitor.waInstances);
+      logger.info(`Closing ${instanceNames.length} WhatsApp instance(s)...`);
+
+      for (const name of instanceNames) {
+        // Check timeout
+        if (Date.now() - shutdownStart > shutdownTimeout) {
+          logger.warn('Shutdown timeout reached, forcing exit');
+          break;
+        }
+
+        try {
+          const instance = waMonitor.waInstances[name];
+          if (instance?.client) {
+            await instance.client.end('shutdown');
+            logger.info(`Instance ${name} closed`);
+          }
+        } catch (e: any) {
+          logger.error(`Error closing instance ${name}: ${e.message}`);
+        }
+      }
+
+      // Disconnettere DB
+      await prismaRepository.$disconnect();
+      logger.info('Database disconnected');
+    } catch (e: any) {
+      logger.error(`Error during graceful shutdown: ${e.message}`);
+    }
+
+    logger.info('Graceful shutdown completed');
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 }
 
 bootstrap();

@@ -367,11 +367,21 @@ export class WatchdogService {
 
   /**
    * Restart entire PM2 process (nuclear option)
+   * ✅ FIX 5: Aggiunto timeout 30s per evitare blocco indefinito
    */
   private async restartPm2Process(): Promise<void> {
     return new Promise((resolve) => {
+      const PM2_RESTART_TIMEOUT = 30000; // 30 secondi
+
+      // Timeout per prevenire blocco indefinito
+      const timeout = setTimeout(() => {
+        this.log('ERROR', 'PM2 restart timeout after 30s');
+        resolve();
+      }, PM2_RESTART_TIMEOUT);
+
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       exec(`pm2 restart ${this.config.pm2ProcessName}`, (error, stdout, _stderr) => {
+        clearTimeout(timeout);
         if (error) {
           this.log('ERROR', `PM2 restart failed: ${error.message}`);
         } else {

@@ -1,5 +1,6 @@
 import { ICache } from '@api/abstract/abstract.cache';
 import { Logger } from '@config/logger.config';
+import { withRedisTimeout } from '@utils/async-timeout';
 import { BufferJSON } from 'baileys';
 
 export class CacheService {
@@ -17,7 +18,12 @@ export class CacheService {
     if (!this.cache) {
       return;
     }
-    return this.cache.get(key);
+    try {
+      return await withRedisTimeout(this.cache.get(key), 'cache:get');
+    } catch (error) {
+      this.logger.error(`[cache:get] ${error.message}`);
+      return null;
+    }
   }
 
   public async hGet(key: string, field: string) {
@@ -25,7 +31,7 @@ export class CacheService {
       return null;
     }
     try {
-      const data = await this.cache.hGet(key, field);
+      const data = await withRedisTimeout(this.cache.hGet(key, field), 'cache:hGet');
 
       if (data) {
         return JSON.parse(data, BufferJSON.reviver);
@@ -33,7 +39,7 @@ export class CacheService {
 
       return null;
     } catch (error) {
-      this.logger.error(error);
+      this.logger.error(`[cache:hGet] ${error.message}`);
       return null;
     }
   }
@@ -42,7 +48,12 @@ export class CacheService {
     if (!this.cache) {
       return;
     }
-    this.cache.set(key, value, ttl);
+    try {
+      // Note: ICache.set() is synchronous (returns void), no timeout needed
+      this.cache.set(key, value, ttl);
+    } catch (error) {
+      this.logger.error(`[cache:set] ${error.message}`);
+    }
   }
 
   public async hSet(key: string, field: string, value: any) {
@@ -51,10 +62,9 @@ export class CacheService {
     }
     try {
       const json = JSON.stringify(value, BufferJSON.replacer);
-
-      await this.cache.hSet(key, field, json);
+      await withRedisTimeout(this.cache.hSet(key, field, json), 'cache:hSet');
     } catch (error) {
-      this.logger.error(error);
+      this.logger.error(`[cache:hSet] ${error.message}`);
     }
   }
 
@@ -62,14 +72,24 @@ export class CacheService {
     if (!this.cache) {
       return;
     }
-    return this.cache.has(key);
+    try {
+      return await withRedisTimeout(this.cache.has(key), 'cache:has');
+    } catch (error) {
+      this.logger.error(`[cache:has] ${error.message}`);
+      return false;
+    }
   }
 
   async delete(key: string) {
     if (!this.cache) {
       return;
     }
-    return this.cache.delete(key);
+    try {
+      return await withRedisTimeout(this.cache.delete(key), 'cache:delete');
+    } catch (error) {
+      this.logger.error(`[cache:delete] ${error.message}`);
+      return false;
+    }
   }
 
   async hDelete(key: string, field: string) {
@@ -77,10 +97,10 @@ export class CacheService {
       return false;
     }
     try {
-      await this.cache.hDelete(key, field);
+      await withRedisTimeout(this.cache.hDelete(key, field), 'cache:hDelete');
       return true;
     } catch (error) {
-      this.logger.error(error);
+      this.logger.error(`[cache:hDelete] ${error.message}`);
       return false;
     }
   }
@@ -89,13 +109,23 @@ export class CacheService {
     if (!this.cache) {
       return;
     }
-    return this.cache.deleteAll(appendCriteria);
+    try {
+      return await withRedisTimeout(this.cache.deleteAll(appendCriteria), 'cache:deleteAll');
+    } catch (error) {
+      this.logger.error(`[cache:deleteAll] ${error.message}`);
+      return false;
+    }
   }
 
   async keys(appendCriteria?: string) {
     if (!this.cache) {
       return;
     }
-    return this.cache.keys(appendCriteria);
+    try {
+      return await withRedisTimeout(this.cache.keys(appendCriteria), 'cache:keys');
+    } catch (error) {
+      this.logger.error(`[cache:keys] ${error.message}`);
+      return [];
+    }
   }
 }

@@ -15,6 +15,7 @@ import {
 } from '@api/dto/health-monitor.dto';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { Logger } from '@config/logger.config';
+import { withDbTimeout } from '@utils/async-timeout';
 import { CircuitBreakerRegistry } from '@utils/circuit-breaker';
 
 import { WAMonitoringService } from './monitor.service';
@@ -52,11 +53,14 @@ export class HealthMonitorService {
    */
   public async getSystemHealth(): Promise<SystemHealthDto> {
     try {
-      const instances = await this.prismaRepository.instance.findMany({
-        include: {
-          WatchdogHeartbeat: true,
-        },
-      });
+      const instances = await withDbTimeout(
+        this.prismaRepository.instance.findMany({
+          include: {
+            WatchdogHeartbeat: true,
+          },
+        }),
+        'healthMonitor:getSystemHealth:findInstances',
+      );
 
       let connectedInstances = 0;
       let connectingInstances = 0;
@@ -130,11 +134,14 @@ export class HealthMonitorService {
    */
   public async getAllInstancesHealth(): Promise<InstanceHealthDto[]> {
     try {
-      const instances = await this.prismaRepository.instance.findMany({
-        include: {
-          WatchdogHeartbeat: true,
-        },
-      });
+      const instances = await withDbTimeout(
+        this.prismaRepository.instance.findMany({
+          include: {
+            WatchdogHeartbeat: true,
+          },
+        }),
+        'healthMonitor:getAllInstancesHealth:findInstances',
+      );
 
       return instances.map((instance) => this.mapInstanceToHealthDto(instance, instance.WatchdogHeartbeat));
     } catch (error) {
@@ -148,12 +155,15 @@ export class HealthMonitorService {
    */
   public async getInstanceHealth(instanceName: string): Promise<InstanceHealthDto | null> {
     try {
-      const instance = await this.prismaRepository.instance.findUnique({
-        where: { name: instanceName },
-        include: {
-          WatchdogHeartbeat: true,
-        },
-      });
+      const instance = await withDbTimeout(
+        this.prismaRepository.instance.findUnique({
+          where: { name: instanceName },
+          include: {
+            WatchdogHeartbeat: true,
+          },
+        }),
+        'healthMonitor:getInstanceHealth:findInstance',
+      );
 
       if (!instance) {
         return null;
@@ -174,24 +184,30 @@ export class HealthMonitorService {
       const where: Record<string, unknown> = {};
 
       if (instanceName) {
-        const instance = await this.prismaRepository.instance.findUnique({
-          where: { name: instanceName },
-        });
+        const instance = await withDbTimeout(
+          this.prismaRepository.instance.findUnique({
+            where: { name: instanceName },
+          }),
+          'healthMonitor:getRecentEvents:findInstance',
+        );
         if (instance) {
           where.instanceId = instance.id;
         }
       }
 
-      const events = await this.prismaRepository.healthEvent.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        take: limit,
-        include: {
-          Instance: {
-            select: { name: true },
+      const events = await withDbTimeout(
+        this.prismaRepository.healthEvent.findMany({
+          where,
+          orderBy: { createdAt: 'desc' },
+          take: limit,
+          include: {
+            Instance: {
+              select: { name: true },
+            },
           },
-        },
-      });
+        }),
+        'healthMonitor:getRecentEvents:findEvents',
+      );
 
       return events.map((event) => ({
         id: event.id,
@@ -218,9 +234,12 @@ export class HealthMonitorService {
     limit: number = 100,
   ): Promise<HealthEventDto[]> {
     try {
-      const instance = await this.prismaRepository.instance.findUnique({
-        where: { name: instanceName },
-      });
+      const instance = await withDbTimeout(
+        this.prismaRepository.instance.findUnique({
+          where: { name: instanceName },
+        }),
+        'healthMonitor:getInstanceEvents:findInstance',
+      );
 
       if (!instance) {
         return [];
@@ -228,14 +247,17 @@ export class HealthMonitorService {
 
       const sinceDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
-      const events = await this.prismaRepository.healthEvent.findMany({
-        where: {
-          instanceId: instance.id,
-          createdAt: { gte: sinceDate },
-        },
-        orderBy: { createdAt: 'desc' },
-        take: limit,
-      });
+      const events = await withDbTimeout(
+        this.prismaRepository.healthEvent.findMany({
+          where: {
+            instanceId: instance.id,
+            createdAt: { gte: sinceDate },
+          },
+          orderBy: { createdAt: 'desc' },
+          take: limit,
+        }),
+        'healthMonitor:getInstanceEvents:findEvents',
+      );
 
       return events.map((event) => ({
         id: event.id,
@@ -310,11 +332,14 @@ export class HealthMonitorService {
     try {
       const cutoffDate = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
 
-      const result = await this.prismaRepository.healthEvent.deleteMany({
-        where: {
-          createdAt: { lt: cutoffDate },
-        },
-      });
+      const result = await withDbTimeout(
+        this.prismaRepository.healthEvent.deleteMany({
+          where: {
+            createdAt: { lt: cutoffDate },
+          },
+        }),
+        'healthMonitor:cleanupOldEvents:deleteMany',
+      );
 
       this.logger.info(`Cleaned up ${result.count} old health events`);
       return result.count;
@@ -336,14 +361,20 @@ export class HealthMonitorService {
       const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
       // Get most recent heartbeat to determine watchdog status
-      const latestHeartbeat = await this.prismaRepository.watchdogHeartbeat.findFirst({
-        orderBy: { lastHeartbeat: 'desc' },
-      });
+      const latestHeartbeat = await withDbTimeout(
+        this.prismaRepository.watchdogHeartbeat.findFirst({
+          orderBy: { lastHeartbeat: 'desc' },
+        }),
+        'healthMonitor:getWatchdogMetrics:latestHeartbeat',
+      );
 
       // Get oldest heartbeat to calculate total checks (estimated)
-      const oldestHeartbeat = await this.prismaRepository.watchdogHeartbeat.findFirst({
-        orderBy: { createdAt: 'asc' },
-      });
+      const oldestHeartbeat = await withDbTimeout(
+        this.prismaRepository.watchdogHeartbeat.findFirst({
+          orderBy: { createdAt: 'asc' },
+        }),
+        'healthMonitor:getWatchdogMetrics:oldestHeartbeat',
+      );
 
       // Determine watchdog status
       let status: 'running' | 'stopped' | 'unknown' = 'unknown';
@@ -368,30 +399,42 @@ export class HealthMonitorService {
       // Count recovery events
       const [recoveriesTotal, recoveriesToday, recoveriesThisWeek, criticalRecoveries] = await Promise.all([
         // Total recoveries all time
-        this.prismaRepository.healthEvent.count({
-          where: { eventType: 'watchdog_recovery' },
-        }),
+        withDbTimeout(
+          this.prismaRepository.healthEvent.count({
+            where: { eventType: 'watchdog_recovery' },
+          }),
+          'healthMonitor:getWatchdogMetrics:recoveriesTotal',
+        ),
         // Recoveries today
-        this.prismaRepository.healthEvent.count({
-          where: {
-            eventType: 'watchdog_recovery',
-            createdAt: { gte: todayStart },
-          },
-        }),
+        withDbTimeout(
+          this.prismaRepository.healthEvent.count({
+            where: {
+              eventType: 'watchdog_recovery',
+              createdAt: { gte: todayStart },
+            },
+          }),
+          'healthMonitor:getWatchdogMetrics:recoveriesToday',
+        ),
         // Recoveries this week
-        this.prismaRepository.healthEvent.count({
-          where: {
-            eventType: 'watchdog_recovery',
-            createdAt: { gte: weekAgo },
-          },
-        }),
+        withDbTimeout(
+          this.prismaRepository.healthEvent.count({
+            where: {
+              eventType: 'watchdog_recovery',
+              createdAt: { gte: weekAgo },
+            },
+          }),
+          'healthMonitor:getWatchdogMetrics:recoveriesThisWeek',
+        ),
         // Critical (failed) recoveries - severity 'critical' means > 3 attempts
-        this.prismaRepository.healthEvent.count({
-          where: {
-            eventType: 'watchdog_recovery',
-            severity: 'critical',
-          },
-        }),
+        withDbTimeout(
+          this.prismaRepository.healthEvent.count({
+            where: {
+              eventType: 'watchdog_recovery',
+              severity: 'critical',
+            },
+          }),
+          'healthMonitor:getWatchdogMetrics:criticalRecoveries',
+        ),
       ]);
 
       // Calculate success rate
@@ -569,20 +612,26 @@ export class HealthMonitorService {
   private async checkWatchdogStatus(): Promise<'running' | 'stopped' | 'unknown'> {
     try {
       // Check if there are recent heartbeats (within last 2 minutes)
-      const recentHeartbeat = await this.prismaRepository.watchdogHeartbeat.findFirst({
-        where: {
-          lastHeartbeat: {
-            gte: new Date(Date.now() - 120000),
+      const recentHeartbeat = await withDbTimeout(
+        this.prismaRepository.watchdogHeartbeat.findFirst({
+          where: {
+            lastHeartbeat: {
+              gte: new Date(Date.now() - 120000),
+            },
           },
-        },
-      });
+        }),
+        'healthMonitor:checkWatchdogStatus:recentHeartbeat',
+      );
 
       if (recentHeartbeat) {
         return 'running';
       }
 
       // Check if there are any heartbeats at all
-      const anyHeartbeat = await this.prismaRepository.watchdogHeartbeat.findFirst();
+      const anyHeartbeat = await withDbTimeout(
+        this.prismaRepository.watchdogHeartbeat.findFirst(),
+        'healthMonitor:checkWatchdogStatus:anyHeartbeat',
+      );
       if (anyHeartbeat) {
         return 'stopped';
       }

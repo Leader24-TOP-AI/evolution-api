@@ -260,7 +260,7 @@ export class BaileysStartupService extends ChannelStartupService {
     });
 
     // ✅ FIX: Salva unsubscribe per evitare memory leak (callback accumulation)
-    this.circuitBreakerUnsubscribe = this.circuitBreaker.onCircuitOpen((name, reason) => {
+    const unsubscribeOpen = this.circuitBreaker.onCircuitOpen((name, reason) => {
       this.logger.error(`[CircuitBreaker] Instance ${name} - CIRCUIT OPENED: ${reason}`);
       this.sendDataWebhook(Events.CONNECTION_UPDATE, {
         instance: name,
@@ -270,6 +270,59 @@ export class BaileysStartupService extends ChannelStartupService {
         timestamp: new Date().toISOString(),
       });
     });
+
+    // ✅ BUG FIX 2: Auto-recovery quando circuit entra in HALF_OPEN
+    // Questo risolve il problema dove l'istanza rimaneva bloccata per sempre dopo circuit OPEN
+    const unsubscribeHalfOpen = this.circuitBreaker.onCircuitHalfOpen((name) => {
+      this.logger.info(`[CircuitBreaker] Instance ${name} - CIRCUIT HALF_OPEN: Attempting auto-recovery...`);
+      this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+        instance: name,
+        event: 'circuit_breaker_half_open',
+        state: this.stateConnection.state,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Trigger auto-recovery SOLO se non è già in corso un restart
+      if (!this.isRestartInProgress && !this.isAutoRestarting) {
+        this.logger.info(`[CircuitBreaker] Instance ${name} - Triggering reconnection attempt from HALF_OPEN`);
+        // Reset retry counter per permettere nuovi tentativi
+        this.autoRestartAttempts = 0;
+        // Trigger reconnection
+        this.connectToWhatsapp().catch((err) => {
+          this.logger.error(`[CircuitBreaker] Instance ${name} - Auto-recovery failed: ${err.message}`);
+          this.circuitBreaker.recordFailure(`auto_recovery_failed: ${err.message}`);
+        });
+      } else {
+        this.logger.warn(`[CircuitBreaker] Instance ${name} - Skipping auto-recovery (restart already in progress)`);
+      }
+    });
+
+    // Store combined unsubscribe function
+    this.circuitBreakerUnsubscribe = () => {
+      unsubscribeOpen();
+      unsubscribeHalfOpen();
+    };
+  }
+
+  /**
+   * Override setInstance to update Circuit Breaker and ResourceRegistry names
+   * ✅ BUG FIX 1: Il circuit breaker era creato con nome 'pending-init' invece del nome istanza
+   * Questo causava confusione nei log e recovery non funzionante per istanza specifica
+   */
+  public setInstance(instance: import('@api/dto/instance.dto').InstanceDto): void {
+    // Call parent method first to set this.instance.name
+    super.setInstance(instance);
+
+    // Now update Circuit Breaker and ResourceRegistry with the actual instance name
+    if (this.circuitBreaker && instance.instanceName) {
+      this.circuitBreaker.updateName(instance.instanceName);
+      this.logger.info(`[SetInstance] Circuit Breaker name updated to: ${instance.instanceName}`);
+    }
+
+    if (this.resourceRegistry && instance.instanceName) {
+      this.resourceRegistry.updateName(instance.instanceName);
+      this.logger.info(`[SetInstance] ResourceRegistry name updated to: ${instance.instanceName}`);
+    }
   }
 
   private authStateProvider: AuthStateProvider;
@@ -426,7 +479,11 @@ export class BaileysStartupService extends ChannelStartupService {
   public async getProfileName() {
     let profileName = this.client.user?.name ?? this.client.user?.verifiedName;
     if (!profileName) {
-      const data = await this.prismaRepository.session.findUnique({ where: { sessionId: this.instanceId } });
+      // ✅ FIX 4: Timeout su query DB per evitare blocco indefinito
+      const data = await withDbTimeout(
+        this.prismaRepository.session.findUnique({ where: { sessionId: this.instanceId } }),
+        'getProfileName:sessionFind',
+      );
 
       if (data) {
         const creds = JSON.parse(JSON.stringify(data.creds), BufferJSON.reviver);
@@ -1975,17 +2032,22 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.eventHandler();
 
-    this.client.ws.on('CB:call', (packet) => {
+    // ✅ FIX 7: Registra WS listeners nel ResourceRegistry per tracking e cleanup
+    const cbCallHandler = (packet: unknown) => {
       console.log('CB:call', packet);
       const payload = { event: 'CB:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
-    });
+    };
+    this.client.ws.on('CB:call', cbCallHandler);
+    this.resourceRegistry.addListener('ws-cb-call', this.client.ws, 'CB:call', cbCallHandler);
 
-    this.client.ws.on('CB:ack,class:call', (packet) => {
+    const cbAckCallHandler = (packet: unknown) => {
       console.log('CB:ack,class:call', packet);
       const payload = { event: 'CB:ack,class:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
-    });
+    };
+    this.client.ws.on('CB:ack,class:call', cbAckCallHandler);
+    this.resourceRegistry.addListener('ws-cb-ack-call', this.client.ws, 'CB:ack,class:call', cbAckCallHandler);
 
     this.phoneNumber = number;
 
@@ -4309,6 +4371,9 @@ export class BaileysStartupService extends ChannelStartupService {
         'pipe:1',
       ]);
 
+      // ✅ FIX 6: Registra FFmpeg nel ResourceRegistry per tracking e cleanup
+      this.resourceRegistry.addProcess(ffmpegProcess, 'ffmpeg-audio-conversion');
+
       const outputChunks: Buffer[] = [];
       let stderrData = '';
 
@@ -4322,11 +4387,15 @@ export class BaileysStartupService extends ChannelStartupService {
       });
 
       ffmpegProcess.on('error', (error) => {
+        // ✅ FIX 6: Rimuovi processo dal registry in caso di errore
+        this.resourceRegistry.removeProcess(ffmpegProcess);
         console.error('Error in ffmpeg process', error);
         reject(error);
       });
 
       ffmpegProcess.on('close', (code) => {
+        // ✅ FIX 6: Rimuovi processo dal registry quando termina
+        this.resourceRegistry.removeProcess(ffmpegProcess);
         if (code === 0) {
           this.logger.verbose('Audio converted to mp4');
           const outputBuffer = Buffer.concat(outputChunks);

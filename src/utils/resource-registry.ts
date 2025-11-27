@@ -86,6 +86,21 @@ export class ResourceRegistry {
     this.instanceName = instanceName;
   }
 
+  /**
+   * Update the instance name (used after instance name is set)
+   * ✅ BUG FIX: Permette di aggiornare il nome dopo la costruzione
+   */
+  public updateName(newName: string): void {
+    this.instanceName = newName;
+  }
+
+  /**
+   * Get the current instance name
+   */
+  public getName(): string {
+    return this.instanceName;
+  }
+
   // ==========================================
   // TIMER MANAGEMENT
   // ==========================================

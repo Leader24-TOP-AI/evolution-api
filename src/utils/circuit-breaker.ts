@@ -144,6 +144,25 @@ export class CircuitBreaker {
     this.logger = new Logger(`CircuitBreaker:${this.config.name}`);
   }
 
+  /**
+   * Update the circuit breaker name (used after instance name is set)
+   * ✅ BUG FIX: Permette di aggiornare il nome dopo la costruzione
+   */
+  public updateName(newName: string): void {
+    const oldName = this.config.name;
+    this.config.name = newName;
+    // Recreate logger with new name
+    (this as any).logger = new Logger(`CircuitBreaker:${newName}`);
+    this.logger.info(`Circuit breaker name updated: ${oldName} → ${newName}`);
+  }
+
+  /**
+   * Get the current circuit breaker name
+   */
+  public getName(): string {
+    return this.config.name;
+  }
+
   // ==========================================
   // CORE OPERATIONS
   // ==========================================
@@ -362,6 +381,29 @@ export class CircuitBreaker {
     return this.onEvent((event, data) => {
       if (event === 'circuit_opened') {
         callback(this.config.name, data.reason || 'unknown');
+      }
+    });
+  }
+
+  /**
+   * Set callback for when circuit transitions to HALF_OPEN (for auto-recovery)
+   * ✅ BUG FIX 2: Permette di triggerare auto-recovery quando circuit entra in HALF_OPEN
+   */
+  onCircuitHalfOpen(callback: (name: string) => void): () => void {
+    return this.onEvent((event) => {
+      if (event === 'circuit_half_open') {
+        callback(this.config.name);
+      }
+    });
+  }
+
+  /**
+   * Set callback for when circuit closes (recovery successful)
+   */
+  onCircuitClose(callback: (name: string) => void): () => void {
+    return this.onEvent((event) => {
+      if (event === 'circuit_closed') {
+        callback(this.config.name);
       }
     });
   }
