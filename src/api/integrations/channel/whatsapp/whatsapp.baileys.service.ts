@@ -916,6 +916,7 @@ export class BaileysStartupService extends ChannelStartupService {
         // Cancella timer precedente se esiste
         if (this.connectingTimer) {
           clearTimeout(this.connectingTimer);
+          this.connectingTimer = null;
         }
 
         // ✅ BACKOFF: Usa delay dinamico invece di fisso
