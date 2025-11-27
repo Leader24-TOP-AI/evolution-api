@@ -113,6 +113,8 @@ model Instance {
   Evoai                   Evoai[]
   EvoaiSetting            EvoaiSetting?
   ProxyStatus             ProxyStatus?
+  WatchdogHeartbeat       WatchdogHeartbeat?
+  HealthEvent             HealthEvent[]
 }
 
 model Session {
@@ -795,5 +797,40 @@ model ProxyHistory {
   ProxyStatus   ProxyStatus @relation(fields: [proxyStatusId], references: [id], onDelete: Cascade)
 
   @@index([proxyStatusId])
+  @@index([createdAt])
+}
+
+// ✅ DEFENSE IN DEPTH - Layer 3: Watchdog Heartbeat per monitoraggio esterno
+model WatchdogHeartbeat {
+  id               String    @id @default(cuid())
+  instanceId       String    @unique
+  processId        Int       @db.Integer
+  lastHeartbeat    DateTime  @db.Timestamp
+  state            String    @db.VarChar(20)
+  stuckSince       DateTime? @db.Timestamp
+  recoveryAttempts Int       @default(0) @db.Integer
+  circuitState     String?   @db.VarChar(20)
+  lastRecovery     DateTime? @db.Timestamp
+  createdAt        DateTime  @default(now()) @db.Timestamp
+  updatedAt        DateTime  @updatedAt @db.Timestamp
+  Instance         Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  @@index([lastHeartbeat])
+  @@index([state])
+}
+
+// ✅ DEFENSE IN DEPTH - Health Events Log per dashboard e debugging
+model HealthEvent {
+  id         String   @id @default(cuid())
+  instanceId String
+  eventType  String   @db.VarChar(50)
+  severity   String   @db.VarChar(20)
+  message    String   @db.Text
+  details    Json?    @db.JsonB
+  createdAt  DateTime @default(now()) @db.Timestamp
+  Instance   Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  @@index([instanceId])
+  @@index([eventType])
   @@index([createdAt])
 }

@@ -17,6 +17,7 @@ import { BusinessRouter } from './business.router';
 import { CallRouter } from './call.router';
 import { ChatRouter } from './chat.router';
 import { GroupRouter } from './group.router';
+import { HealthMonitorRouter } from './health-monitor.router';
 import { InstanceRouter } from './instance.router';
 import { LabelRouter } from './label.router';
 import { LogsRouter } from './logs.router';
@@ -221,6 +222,7 @@ router
   .use('/settings', new SettingsRouter(...guards).router)
   .use('/proxy', new ProxyRouter(...guards).router)
   .use('/proxy-monitor', new ProxyMonitorRouter(...guards).router)
+  .use('/health-monitor', new HealthMonitorRouter(...guards).router)
   .use('/label', new LabelRouter(...guards).router)
   .use('/logs', new LogsRouter().router)
   .use('', new ChannelRouter(configService, ...guards).router)

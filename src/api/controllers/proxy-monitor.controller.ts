@@ -23,10 +23,10 @@ export class ProxyMonitorController {
   }
 
   /**
-   * Get proxy history for a single instance
+   * Get proxy history for a single instance (last 10 IPs)
    */
   public async getHistory(instance: InstanceDto): Promise<ProxyHistoryDto[]> {
-    return this.proxyMonitorService.getHistory(instance.instanceName);
+    return this.proxyMonitorService.getHistory(instance.instanceName, 7, 10);
   }
 
   /**

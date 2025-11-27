@@ -7,6 +7,7 @@ import { BusinessController } from './controllers/business.controller';
 import { CallController } from './controllers/call.controller';
 import { ChatController } from './controllers/chat.controller';
 import { GroupController } from './controllers/group.controller';
+import { HealthMonitorController } from './controllers/health-monitor.controller';
 import { InstanceController } from './controllers/instance.controller';
 import { LabelController } from './controllers/label.controller';
 import { ProxyController } from './controllers/proxy.controller';
@@ -41,6 +42,7 @@ import { S3Service } from './integrations/storage/s3/services/s3.service';
 import { ProviderFiles } from './provider/sessions';
 import { PrismaRepository } from './repository/repository.service';
 import { CacheService } from './services/cache.service';
+import { HealthMonitorService } from './services/health-monitor.service';
 import { WAMonitoringService } from './services/monitor.service';
 import { ProxyService } from './services/proxy.service';
 import { ProxyMonitorService } from './services/proxy-monitor.service';
@@ -85,6 +87,9 @@ export const proxyController = new ProxyController(proxyService, waMonitor);
 
 export const proxyMonitorService = new ProxyMonitorService(waMonitor, prismaRepository);
 export const proxyMonitorController = new ProxyMonitorController(proxyMonitorService);
+
+export const healthMonitorService = new HealthMonitorService(waMonitor, prismaRepository);
+export const healthMonitorController = new HealthMonitorController(healthMonitorService);
 
 const chatwootService = new ChatwootService(waMonitor, configService, prismaRepository, chatwootCache);
 export const chatwootController = new ChatwootController(chatwootService, configService, prismaRepository);

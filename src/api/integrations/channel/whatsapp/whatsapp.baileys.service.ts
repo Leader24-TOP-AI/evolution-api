@@ -80,11 +80,15 @@ import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
+// ✅ DEFENSE IN DEPTH: Import nuove utility per protezione 100%
+import { TimeoutError, withDbTimeout } from '@utils/async-timeout';
+import { CircuitBreaker } from '@utils/circuit-breaker';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
+import { ResourceRegistry } from '@utils/resource-registry';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
 import { AuthStateProvider } from '@utils/use-multi-file-auth-state-provider-files';
@@ -240,6 +244,32 @@ export class BaileysStartupService extends ChannelStartupService {
     });
 
     this.authStateProvider = new AuthStateProvider(this.providerFiles);
+
+    // ✅ DEFENSE IN DEPTH: Inizializza Layer 1 (Resource Registry) e Layer 2 (Circuit Breaker)
+    // Il nome istanza viene settato dopo, quindi usiamo un placeholder temporaneo
+    this.resourceRegistry = new ResourceRegistry('pending-init');
+
+    // Circuit Breaker con configurazione ottimizzata per WhatsApp
+    this.circuitBreaker = new CircuitBreaker({
+      name: 'pending-init',
+      failureThreshold: 5, // 5 fallimenti prima di aprire
+      successThreshold: 2, // 2 successi per chiudere
+      resetTimeout: 60000, // 60s in OPEN prima di HALF_OPEN
+      halfOpenMaxAttempts: 3, // 3 tentativi in HALF_OPEN
+      failureWindowMs: 60000, // Finestra 60s per contare fallimenti
+    });
+
+    // Callback per notifica quando circuit si apre
+    this.circuitBreaker.onCircuitOpen((name, reason) => {
+      this.logger.error(`[CircuitBreaker] Instance ${name} - CIRCUIT OPENED: ${reason}`);
+      this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+        instance: name,
+        event: 'circuit_breaker_open',
+        reason: reason,
+        state: this.stateConnection.state,
+        timestamp: new Date().toISOString(),
+      });
+    });
   }
 
   private authStateProvider: AuthStateProvider;
@@ -292,6 +322,25 @@ export class BaileysStartupService extends ChannelStartupService {
   // ✅ FIX #11: Log state tracking
   private lastLoggedHealthState: { state: string; age: number } | null = null;
 
+  // ✅ DEFENSE IN DEPTH - Layer 1: Resource Registry per tracking e cleanup
+  private resourceRegistry: ResourceRegistry;
+
+  // ✅ DEFENSE IN DEPTH - Layer 2: Circuit Breaker per fail-fast
+  private circuitBreaker: CircuitBreaker;
+
+  // ✅ DEFENSE IN DEPTH - Hard limits per prevenire loop infiniti
+  private readonly HARD_MAX_RESTART_ATTEMPTS = 20; // Limite assoluto restart
+  private readonly HARD_MAX_RECURSION_DEPTH = 3; // Limite recursione safety timeout
+  private safetyTimeoutRecursionDepth = 0; // Contatore recursione corrente
+  private globalRestartCounter = 0; // Contatore restart in finestra temporale
+  private globalRestartResetTimer: NodeJS.Timeout | null = null;
+  private readonly GLOBAL_RESTART_WINDOW = 300000; // 5 minuti
+  private readonly GLOBAL_RESTART_MAX = 30; // Max 30 restart in 5 minuti
+
+  // ✅ DEFENSE IN DEPTH - Layer 3: Heartbeat per watchdog esterno
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private readonly HEARTBEAT_INTERVAL = 30000; // 30 secondi
+
   // ✅ EXPONENTIAL BACKOFF - Sostituisce limiti rigidi per evitare blocco permanente
   private currentRestartDelay = 5000; // Delay attuale (inizia 5s)
   private readonly MIN_RESTART_DELAY = 5000; // Minimo 5s
@@ -314,8 +363,9 @@ export class BaileysStartupService extends ChannelStartupService {
     this.logger.info(`[Logout] Instance ${this.instance.name} - 🧹 Performing complete client cleanup...`);
     this.cleanupClient('logout');
 
-    // Ferma health check
+    // Ferma health check e heartbeat
     this.stopHealthCheck();
+    this.stopHeartbeat();
 
     // Reset tutti i flag
     this.isAutoRestarting = false;
@@ -603,6 +653,19 @@ export class BaileysStartupService extends ChannelStartupService {
       this.forceRestartAttempts = 0;
       this.lastForceRestartTime = 0;
 
+      // ✅ DEFENSE IN DEPTH - Layer 2: Registra successo nel Circuit Breaker
+      this.circuitBreaker.recordSuccess();
+      this.safetyTimeoutRecursionDepth = 0; // Reset recursion counter
+      this.globalRestartCounter = 0; // Reset global counter
+
+      // ✅ DEFENSE IN DEPTH: Reset timer global restart counter
+      if (this.globalRestartResetTimer) {
+        clearTimeout(this.globalRestartResetTimer);
+      }
+      this.globalRestartResetTimer = setTimeout(() => {
+        this.globalRestartCounter = 0;
+      }, this.GLOBAL_RESTART_WINDOW);
+
       // ✅ BACKOFF: Reset delay e registra timestamp successo
       this.currentRestartDelay = this.MIN_RESTART_DELAY;
       this.lastSuccessfulConnection = Date.now();
@@ -613,6 +676,9 @@ export class BaileysStartupService extends ChannelStartupService {
       // ✅ FASE 2: Update timestamp e avvia health check
       this.lastStateChangeTimestamp = Date.now();
       this.startHealthCheck();
+
+      // ✅ DEFENSE IN DEPTH - Layer 3: Avvia heartbeat per watchdog esterno
+      this.startHeartbeat();
 
       // ✅ FIX #8: Cache ownerJid per evitare query DB ripetute
       this.cachedOwnerJid = this.client.user.id.replace(/:\d+/, '');
@@ -760,6 +826,33 @@ export class BaileysStartupService extends ChannelStartupService {
         return;
       }
 
+      // ✅ DEFENSE IN DEPTH - Layer 2: Check Circuit Breaker PRIMA di tutto
+      if (!this.circuitBreaker.canExecute()) {
+        this.logger.error(
+          `[Auto-Restart] Instance ${this.instance.name} - ❌ Circuit Breaker is ${this.circuitBreaker.getState()}, refusing restart`,
+        );
+        return;
+      }
+
+      // ✅ DEFENSE IN DEPTH - Hard limit: contatore globale restart
+      this.globalRestartCounter++;
+      if (this.globalRestartCounter > this.GLOBAL_RESTART_MAX) {
+        this.logger.error(
+          `[Auto-Restart] Instance ${this.instance.name} - ❌ HARD LIMIT: ${this.globalRestartCounter} restarts in ${this.GLOBAL_RESTART_WINDOW / 1000}s window. Tripping circuit breaker.`,
+        );
+        this.circuitBreaker.tripCircuit('exceeded_global_restart_limit');
+        return;
+      }
+
+      // ✅ DEFENSE IN DEPTH - Hard limit: max tentativi assoluto
+      if (this.autoRestartAttempts >= this.HARD_MAX_RESTART_ATTEMPTS) {
+        this.logger.error(
+          `[Auto-Restart] Instance ${this.instance.name} - ❌ HARD LIMIT: ${this.autoRestartAttempts} attempts reached. Tripping circuit breaker.`,
+        );
+        this.circuitBreaker.tripCircuit('exceeded_hard_max_attempts');
+        return;
+      }
+
       this.isRestartInProgress = true; // ← Lock per prevenire duplicati
       this.isAutoRestartTriggered = true;
       this.autoRestartAttempts++;
@@ -870,13 +963,28 @@ export class BaileysStartupService extends ChannelStartupService {
               this.client.end(new Error('Safety timeout - forcing close to retry'));
             }
 
+            // ✅ DEFENSE IN DEPTH: Limite recursione safety timeout
+            this.safetyTimeoutRecursionDepth++;
+            if (this.safetyTimeoutRecursionDepth >= this.HARD_MAX_RECURSION_DEPTH) {
+              this.logger.error(
+                `[Auto-Restart] Instance ${this.instance.name} - ❌ Safety timeout recursion LIMIT (${this.HARD_MAX_RECURSION_DEPTH}) reached. Tripping circuit breaker.`,
+              );
+              this.circuitBreaker.tripCircuit('safety_timeout_recursion_limit');
+              this.circuitBreaker.recordFailure('safety_timeout_max_recursion');
+              this.safetyTimeoutRecursionDepth = 0;
+              this.isRestartInProgress = false;
+              this.isAutoRestarting = false;
+              this.isAutoRestartTriggered = false;
+              return;
+            }
+
             // ✅ FIX #6: Aspetta che il close si propaghi, poi riprova con autoRestart
             setTimeout(() => {
               this.isRestartInProgress = false;
               this.isAutoRestarting = false;
               this.isAutoRestartTriggered = false;
               this.logger.info(
-                `[Auto-Restart] Instance ${this.instance.name} - 🔄 Retrying connection via autoRestart() after safety timeout...`,
+                `[Auto-Restart] Instance ${this.instance.name} - 🔄 Retrying connection via autoRestart() (recursion depth: ${this.safetyTimeoutRecursionDepth}/${this.HARD_MAX_RECURSION_DEPTH})...`,
               );
               this.autoRestart();
             }, 2000);
@@ -1085,6 +1193,107 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  // ✅ DEFENSE IN DEPTH - Layer 3: Heartbeat Functions per Watchdog Esterno
+
+  /**
+   * Avvia il heartbeat periodico per il watchdog esterno
+   * Il watchdog può rilevare istanze bloccate quando l'heartbeat smette di aggiornarsi
+   */
+  private startHeartbeat() {
+    this.stopHeartbeat();
+
+    this.logger.info(
+      `[Heartbeat] Instance ${this.instance.name} - Starting heartbeat (interval: ${this.HEARTBEAT_INTERVAL / 1000}s)`,
+    );
+
+    // Prima update immediato
+    this.updateHeartbeat().catch((err) => {
+      this.logger.error(`[Heartbeat] Instance ${this.instance.name} - Initial heartbeat failed: ${err.message}`);
+    });
+
+    // Poi periodico
+    this.heartbeatTimer = setInterval(async () => {
+      try {
+        await this.updateHeartbeat();
+      } catch (error) {
+        this.logger.error(`[Heartbeat] Instance ${this.instance.name} - Heartbeat update failed: ${error.message}`);
+      }
+    }, this.HEARTBEAT_INTERVAL);
+  }
+
+  /**
+   * Ferma il heartbeat
+   */
+  private stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      this.logger.info(`[Heartbeat] Instance ${this.instance.name} - Stopping heartbeat`);
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  /**
+   * Aggiorna il record heartbeat nel database
+   * Il watchdog esterno legge questo record per rilevare istanze bloccate
+   */
+  private async updateHeartbeat() {
+    try {
+      await withDbTimeout(
+        this.prismaRepository.watchdogHeartbeat.upsert({
+          where: { instanceId: this.instanceId },
+          update: {
+            lastHeartbeat: new Date(),
+            state: this.stateConnection.state,
+            processId: process.pid,
+            circuitState: this.circuitBreaker.getState(),
+          },
+          create: {
+            instanceId: this.instanceId,
+            lastHeartbeat: new Date(),
+            state: this.stateConnection.state,
+            processId: process.pid,
+            circuitState: this.circuitBreaker.getState(),
+            recoveryAttempts: 0,
+          },
+        }),
+        'updateHeartbeat',
+      );
+    } catch (error) {
+      // Non loggare ogni errore per evitare spam - solo errori critici
+      if (!(error instanceof TimeoutError)) {
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * Logga un evento di health nel database per la dashboard
+   */
+  private async logHealthEvent(
+    eventType: string,
+    severity: 'info' | 'warn' | 'error' | 'critical',
+    message: string,
+    details?: Record<string, any>,
+  ) {
+    try {
+      await withDbTimeout(
+        this.prismaRepository.healthEvent.create({
+          data: {
+            instanceId: this.instanceId,
+            eventType,
+            severity,
+            message,
+            details: details || {},
+          },
+        }),
+        'logHealthEvent',
+      );
+    } catch (error) {
+      // Silently fail - non bloccare operazioni principali per log
+      this.logger.warn(`[HealthEvent] Failed to log event: ${error.message}`);
+    }
+  }
+
   /**
    * Esegue un controllo di salute dell'istanza
    */
@@ -1141,20 +1350,25 @@ export class BaileysStartupService extends ChannelStartupService {
       // ✅ FIX #8: Usa cache ownerJid se disponibile (evita query DB ripetute)
       let ownerJid = this.cachedOwnerJid;
 
-      // ✅ FIX #3: Se cache vuota, query DB con try-catch (fallback se DB down)
+      // ✅ FIX #3: Se cache vuota, query DB con try-catch E TIMEOUT (fallback se DB down/slow)
       if (ownerJid === null && this.cachedOwnerJid === null) {
         try {
-          const dbInstance = await this.prismaRepository.instance.findUnique({
-            where: { id: this.instanceId },
-            select: { ownerJid: true },
-          });
+          // ✅ DEFENSE IN DEPTH - Layer 1: Timeout 5s su query DB
+          const dbInstance = await withDbTimeout(
+            this.prismaRepository.instance.findUnique({
+              where: { id: this.instanceId },
+              select: { ownerJid: true },
+            }),
+            'healthCheck-findOwnerJid',
+          );
           ownerJid = dbInstance?.ownerJid || null;
           this.cachedOwnerJid = ownerJid; // ✅ Aggiorna cache
         } catch (dbError) {
+          const isTimeout = dbError instanceof TimeoutError;
           this.logger.error(
-            `[HealthCheck] Instance ${this.instance.name} - DB query failed: ${dbError.message}. Skipping force restart (safe fallback).`,
+            `[HealthCheck] Instance ${this.instance.name} - DB query ${isTimeout ? 'TIMEOUT' : 'failed'}: ${dbError.message}. Skipping force restart (safe fallback).`,
           );
-          return; // ✅ Safe fallback: se DB down, NON force restart
+          return; // ✅ Safe fallback: se DB down/slow, NON force restart
         }
       }
 

@@ -215,7 +215,11 @@ export class ProxyMonitorService {
   /**
    * Get proxy history for an instance
    */
-  public async getHistory(instanceName: string, days: number = this.RETENTION_DAYS): Promise<ProxyHistoryDto[]> {
+  public async getHistory(
+    instanceName: string,
+    days: number = this.RETENTION_DAYS,
+    limit?: number,
+  ): Promise<ProxyHistoryDto[]> {
     try {
       const instance = await this.prismaRepository.instance.findUnique({
         where: { name: instanceName },
@@ -234,6 +238,7 @@ export class ProxyMonitorService {
           createdAt: { gte: sinceDate },
         },
         orderBy: { connectedAt: 'desc' },
+        take: limit,
       });
 
       return history.map((h) => this.buildHistoryDto(h));
