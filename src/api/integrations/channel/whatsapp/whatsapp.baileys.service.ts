@@ -259,8 +259,8 @@ export class BaileysStartupService extends ChannelStartupService {
       failureWindowMs: 60000, // Finestra 60s per contare fallimenti
     });
 
-    // Callback per notifica quando circuit si apre
-    this.circuitBreaker.onCircuitOpen((name, reason) => {
+    // ✅ FIX: Salva unsubscribe per evitare memory leak (callback accumulation)
+    this.circuitBreakerUnsubscribe = this.circuitBreaker.onCircuitOpen((name, reason) => {
       this.logger.error(`[CircuitBreaker] Instance ${name} - CIRCUIT OPENED: ${reason}`);
       this.sendDataWebhook(Events.CONNECTION_UPDATE, {
         instance: name,
@@ -328,6 +328,9 @@ export class BaileysStartupService extends ChannelStartupService {
   // ✅ DEFENSE IN DEPTH - Layer 2: Circuit Breaker per fail-fast
   private circuitBreaker: CircuitBreaker;
 
+  // ✅ FIX: Funzione per unsubscribe dal circuit breaker (evita memory leak)
+  private circuitBreakerUnsubscribe: (() => void) | null = null;
+
   // ✅ DEFENSE IN DEPTH - Hard limits per prevenire loop infiniti
   private readonly HARD_MAX_RESTART_ATTEMPTS = 20; // Limite assoluto restart
   private readonly HARD_MAX_RECURSION_DEPTH = 3; // Limite recursione safety timeout
@@ -359,6 +362,21 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.messageProcessor.onDestroy();
 
+    // ✅ FIX 1.5: Unsubscribe dal circuit breaker per evitare memory leak
+    if (this.circuitBreakerUnsubscribe) {
+      this.logger.verbose(`[Logout] Instance ${this.instance.name} - Unsubscribing from circuit breaker`);
+      this.circuitBreakerUnsubscribe();
+      this.circuitBreakerUnsubscribe = null;
+    }
+
+    // ✅ FIX 1.1: Usa ResourceRegistry per cleanup completo di tutte le risorse
+    this.logger.info(`[Logout] Instance ${this.instance.name} - 🧹 Cleaning up all registered resources...`);
+    const cleanupResult = this.resourceRegistry.cleanupAll('logout');
+    this.logger.info(
+      `[Logout] Instance ${this.instance.name} - ResourceRegistry cleanup: ${cleanupResult.total} resources ` +
+        `(${cleanupResult.timers} timers, ${cleanupResult.listeners} listeners, ${cleanupResult.processes} processes)`,
+    );
+
     // ✅ FIX DEFINITIVO: Usa cleanupClient() per cleanup completo e consistente
     this.logger.info(`[Logout] Instance ${this.instance.name} - 🧹 Performing complete client cleanup...`);
     this.cleanupClient('logout');
@@ -378,19 +396,30 @@ export class BaileysStartupService extends ChannelStartupService {
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
     // ✅ FIX #6: Reset ownerJid al logout per permettere riuso nome istanza
-    await this.prismaRepository.instance.update({
-      where: { id: this.instanceId },
-      data: {
-        ownerJid: null,
-        profileName: null,
-        profilePicUrl: null,
-        connectionStatus: 'close',
-      },
-    });
+    // ✅ FIX 2.5: Aggiungo timeout per evitare blocco durante logout
+    await withDbTimeout(
+      this.prismaRepository.instance.update({
+        where: { id: this.instanceId },
+        data: {
+          ownerJid: null,
+          profileName: null,
+          profilePicUrl: null,
+          connectionStatus: 'close',
+        },
+      }),
+      'logout:instanceUpdate',
+    );
 
-    const sessionExists = await this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } });
+    // ✅ FIX 2.5: Aggiungo timeout per evitare blocco durante logout
+    const sessionExists = await withDbTimeout(
+      this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } }),
+      'logout:sessionFind',
+    );
     if (sessionExists) {
-      await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
+      await withDbTimeout(
+        this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } }),
+        'logout:sessionDelete',
+      );
     }
   }
 
@@ -506,10 +535,14 @@ export class BaileysStartupService extends ChannelStartupService {
         ),
       );
 
-      await this.prismaRepository.instance.update({
-        where: { id: this.instanceId },
-        data: { connectionStatus: 'connecting' },
-      });
+      // ✅ FIX 2.5: Timeout su update stato connessione
+      await withDbTimeout(
+        this.prismaRepository.instance.update({
+          where: { id: this.instanceId },
+          data: { connectionStatus: 'connecting' },
+        }),
+        'connectionUpdate:connecting',
+      );
     }
 
     if (connection) {
@@ -595,15 +628,19 @@ export class BaileysStartupService extends ChannelStartupService {
           disconnectionObject: JSON.stringify(lastDisconnect),
         });
 
-        await this.prismaRepository.instance.update({
-          where: { id: this.instanceId },
-          data: {
-            connectionStatus: 'close',
-            disconnectionAt: new Date(),
-            disconnectionReasonCode: statusCode,
-            disconnectionObject: JSON.stringify(lastDisconnect),
-          },
-        });
+        // ✅ FIX 2.5: Timeout su update stato connessione close
+        await withDbTimeout(
+          this.prismaRepository.instance.update({
+            where: { id: this.instanceId },
+            data: {
+              connectionStatus: 'close',
+              disconnectionAt: new Date(),
+              disconnectionReasonCode: statusCode,
+              disconnectionObject: JSON.stringify(lastDisconnect),
+            },
+          }),
+          'connectionUpdate:closeDefinitive',
+        );
 
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
           this.chatwootService.eventWhatsapp(
@@ -705,15 +742,19 @@ export class BaileysStartupService extends ChannelStartupService {
       `,
       );
 
-      await this.prismaRepository.instance.update({
-        where: { id: this.instanceId },
-        data: {
-          ownerJid: this.instance.wuid,
-          profileName: (await this.getProfileName()) as string,
-          profilePicUrl: this.instance.profilePictureUrl,
-          connectionStatus: 'open',
-        },
-      });
+      // ✅ FIX 2.5: Timeout su update stato connessione open
+      await withDbTimeout(
+        this.prismaRepository.instance.update({
+          where: { id: this.instanceId },
+          data: {
+            ownerJid: this.instance.wuid,
+            profileName: (await this.getProfileName()) as string,
+            profilePicUrl: this.instance.profilePictureUrl,
+            connectionStatus: 'open',
+          },
+        }),
+        'connectionUpdate:open',
+      );
 
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
         this.chatwootService.eventWhatsapp(
@@ -785,6 +826,9 @@ export class BaileysStartupService extends ChannelStartupService {
             );
           }
         }, restartDelay);
+
+        // ✅ FIX 1.1: Registra timer nel ResourceRegistry per tracking e cleanup automatico
+        this.resourceRegistry.addTimer(this.connectingTimer, 'connectingTimer');
       } else {
         // Log spiegazione dettagliata
         if (!this.wasOpenBeforeReconnect) {
@@ -1015,6 +1059,9 @@ export class BaileysStartupService extends ChannelStartupService {
         }
         this.safetyTimeout = null;
       }, 30000);
+
+      // ✅ FIX 1.1: Registra safety timeout nel ResourceRegistry per tracking e cleanup automatico
+      this.resourceRegistry.addTimer(this.safetyTimeout, 'safetyTimeout-autoRestart');
     } catch (error) {
       this.logger.error(
         `[Auto-Restart] Instance ${this.instance.name} - ❌ Exception: ${error.toString()}\nStack: ${error.stack}`,
@@ -1180,6 +1227,9 @@ export class BaileysStartupService extends ChannelStartupService {
         );
       }
     }, interval); // ✅ Usa interval con jitter
+
+    // ✅ FIX 1.1: Registra timer nel ResourceRegistry per tracking e cleanup automatico
+    this.resourceRegistry.addInterval(this.healthCheckTimer, 'healthCheck');
   }
 
   /**
@@ -1219,6 +1269,9 @@ export class BaileysStartupService extends ChannelStartupService {
         this.logger.error(`[Heartbeat] Instance ${this.instance.name} - Heartbeat update failed: ${error.message}`);
       }
     }, this.HEARTBEAT_INTERVAL);
+
+    // ✅ FIX 1.1: Registra timer nel ResourceRegistry per tracking e cleanup automatico
+    this.resourceRegistry.addInterval(this.heartbeatTimer, 'heartbeat');
   }
 
   /**
@@ -1676,6 +1729,9 @@ export class BaileysStartupService extends ChannelStartupService {
         }
         this.safetyTimeout = null;
       }, 30000);
+
+      // ✅ FIX 1.1: Registra safety timeout nel ResourceRegistry per tracking e cleanup automatico
+      this.resourceRegistry.addTimer(this.safetyTimeout, 'safetyTimeout-forceRestart');
     } catch (error) {
       this.logger.error(
         `[ForceRestart] Instance ${this.instance.name} - ❌ Exception: ${error.toString()}\nStack: ${error.stack}`,

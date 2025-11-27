@@ -21,6 +21,28 @@ import { PrismaClient } from '@prisma/client';
 import axios from 'axios';
 import { exec } from 'child_process';
 
+// ✅ FIX 1.4: Timeout wrapper per query DB del watchdog
+const DB_TIMEOUT_MS = 10000; // 10 secondi - più alto per il watchdog che deve essere robusto
+
+async function withWatchdogTimeout<T>(promise: Promise<T>, operationName: string): Promise<T> {
+  let timeoutId: NodeJS.Timeout;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`[Watchdog] DB timeout after ${DB_TIMEOUT_MS}ms: ${operationName}`));
+    }, DB_TIMEOUT_MS);
+  });
+
+  try {
+    const result = await Promise.race([promise, timeoutPromise]);
+    clearTimeout(timeoutId!);
+    return result;
+  } catch (error) {
+    clearTimeout(timeoutId!);
+    throw error;
+  }
+}
+
 interface WatchdogConfig {
   checkInterval: number; // How often to check (default: 60s)
   heartbeatTimeout: number; // Max time without heartbeat (default: 90s)
@@ -102,24 +124,56 @@ export class WatchdogService {
   }
 
   /**
+   * ✅ FIX 2.4: Check database connectivity before performing checks
+   * If DB is down, skip the cycle to avoid blocking
+   */
+  private async checkDatabaseHealth(): Promise<boolean> {
+    try {
+      await withWatchdogTimeout(this.prisma.$queryRaw`SELECT 1`, 'dbHealthCheck');
+      return true;
+    } catch (error) {
+      this.log('ERROR', `DB health check failed: ${error}`);
+      try {
+        // Try to reconnect
+        await this.prisma.$disconnect();
+        await this.prisma.$connect();
+        this.log('INFO', 'DB reconnection successful');
+        return true;
+      } catch (reconnectError) {
+        this.log('ERROR', `DB reconnection failed: ${reconnectError}`);
+        return false;
+      }
+    }
+  }
+
+  /**
    * Check all instances for health issues
    */
   private async checkAllInstances(): Promise<void> {
+    // ✅ FIX 2.4: Verify DB is healthy before proceeding
+    if (!(await this.checkDatabaseHealth())) {
+      this.log('ERROR', 'DB unavailable, skipping check cycle');
+      return;
+    }
+
     const now = new Date();
     const heartbeatCutoff = new Date(now.getTime() - this.config.heartbeatTimeout);
     const connectingCutoff = new Date(now.getTime() - this.config.stuckConnectingTimeout);
 
     try {
-      // Get all instances with their heartbeats
-      const instances = await this.prisma.instance.findMany({
-        where: {
-          definitiveLogout: false,
-          connectionStatus: { not: 'close' },
-        },
-        include: {
-          WatchdogHeartbeat: true,
-        },
-      });
+      // ✅ FIX 1.4: Get all instances with their heartbeats (con timeout)
+      const instances = await withWatchdogTimeout(
+        this.prisma.instance.findMany({
+          where: {
+            definitiveLogout: false,
+            connectionStatus: { not: 'close' },
+          },
+          include: {
+            WatchdogHeartbeat: true,
+          },
+        }),
+        'checkAllInstances:findMany',
+      );
 
       this.log('DEBUG', `Checking ${instances.length} active instances`);
 
@@ -144,11 +198,14 @@ export class WatchdogService {
         // SCENARIO 3: Stuck in 'connecting' state
         if (heartbeat.state === 'connecting') {
           if (!heartbeat.stuckSince) {
-            // Mark when we first detected connecting state
-            await this.prisma.watchdogHeartbeat.update({
-              where: { instanceId: instance.id },
-              data: { stuckSince: now },
-            });
+            // ✅ FIX 1.4: Mark when we first detected connecting state (con timeout)
+            await withWatchdogTimeout(
+              this.prisma.watchdogHeartbeat.update({
+                where: { instanceId: instance.id },
+                data: { stuckSince: now },
+              }),
+              'markConnectingStuck',
+            );
             this.log('INFO', `Instance ${instance.name} entered 'connecting' state, starting timer`);
           } else if (heartbeat.stuckSince < connectingCutoff) {
             const stuckDuration = now.getTime() - heartbeat.stuckSince.getTime();
@@ -161,10 +218,14 @@ export class WatchdogService {
         } else {
           // Clear stuckSince if not in connecting state
           if (heartbeat.stuckSince) {
-            await this.prisma.watchdogHeartbeat.update({
-              where: { instanceId: instance.id },
-              data: { stuckSince: null, recoveryAttempts: 0 },
-            });
+            // ✅ FIX 1.4: Clear stuck timer (con timeout)
+            await withWatchdogTimeout(
+              this.prisma.watchdogHeartbeat.update({
+                where: { instanceId: instance.id },
+                data: { stuckSince: null, recoveryAttempts: 0 },
+              }),
+              'clearStuckTimer',
+            );
             this.log('INFO', `Instance ${instance.name} recovered, clearing stuck timer`);
           }
         }
@@ -197,14 +258,22 @@ export class WatchdogService {
     // Log the recovery attempt
     await this.logRecoveryEvent(instanceId, reason, attempts);
 
-    // Update recovery attempts in heartbeat
-    await this.prisma.watchdogHeartbeat.update({
-      where: { instanceId },
-      data: {
-        recoveryAttempts: attempts,
-        lastRecovery: new Date(),
-      },
-    });
+    // ✅ FIX 1.4: Update recovery attempts in heartbeat (con timeout)
+    await withWatchdogTimeout(
+      this.prisma.watchdogHeartbeat.update({
+        where: { instanceId },
+        data: {
+          recoveryAttempts: attempts,
+          lastRecovery: new Date(),
+        },
+      }),
+      'updateRecoveryAttempts',
+    );
+
+    // ✅ FIX 2.2: Exponential backoff - evita recovery troppo rapidi che non aiutano
+    const backoffMs = Math.min(1000 * Math.pow(2, attempts - 1), 30000); // 1s, 2s, 4s, 8s, 16s, max 30s
+    this.log('INFO', `Instance ${instanceName} - Applying backoff delay of ${backoffMs}ms before attempt ${attempts}`);
+    await this.sleep(backoffMs);
 
     // Escalating recovery actions
     if (attempts <= 2) {
@@ -223,6 +292,13 @@ export class WatchdogService {
       );
       await this.restartPm2Process();
     }
+  }
+
+  /**
+   * ✅ FIX 2.2: Sleep utility for exponential backoff
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
@@ -249,13 +325,16 @@ export class WatchdogService {
    */
   private async forceRestartViaDb(instanceId: string, instanceName: string): Promise<void> {
     try {
-      // Reset the instance connection status to force reconnection
-      await this.prisma.instance.update({
-        where: { id: instanceId },
-        data: {
-          connectionStatus: 'close',
-        },
-      });
+      // ✅ FIX 1.4: Reset the instance connection status to force reconnection (con timeout)
+      await withWatchdogTimeout(
+        this.prisma.instance.update({
+          where: { id: instanceId },
+          data: {
+            connectionStatus: 'close',
+          },
+        }),
+        'forceRestartViaDb',
+      );
       this.log('INFO', `Force restart flag set for ${instanceName}`);
     } catch (error: any) {
       this.log('ERROR', `Force restart via DB failed for ${instanceName}: ${error.message}`);
@@ -301,15 +380,19 @@ export class WatchdogService {
    */
   private async logRecoveryEvent(instanceId: string, reason: string, attempt: number): Promise<void> {
     try {
-      await this.prisma.healthEvent.create({
-        data: {
-          instanceId,
-          eventType: 'watchdog_recovery',
-          severity: attempt > 3 ? 'critical' : 'warn',
-          message: `Watchdog recovery attempt ${attempt}: ${reason}`,
-          details: { reason, attempt, timestamp: new Date().toISOString() },
-        },
-      });
+      // ✅ FIX 1.4: Log recovery event (con timeout)
+      await withWatchdogTimeout(
+        this.prisma.healthEvent.create({
+          data: {
+            instanceId,
+            eventType: 'watchdog_recovery',
+            severity: attempt > 3 ? 'critical' : 'warn',
+            message: `Watchdog recovery attempt ${attempt}: ${reason}`,
+            details: { reason, attempt, timestamp: new Date().toISOString() },
+          },
+        }),
+        'logRecoveryEvent',
+      );
     } catch {
       // Silently fail - don't block recovery for logging
     }
