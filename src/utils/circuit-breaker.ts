@@ -108,6 +108,9 @@ interface FailureRecord {
  *   breaker.recordFailure(error.message);
  * }
  */
+// ✅ FIX: Tipo per callback di persistenza stato CB
+export type CircuitBreakerPersistCallback = (state: CircuitState) => Promise<void>;
+
 export class CircuitBreaker {
   private readonly logger: Logger;
   private config: CircuitBreakerConfig;
@@ -118,6 +121,9 @@ export class CircuitBreaker {
   private halfOpenAttempts: number = 0;
   private lastStateChange: number = Date.now();
   private resetTimer: NodeJS.Timeout | null = null;
+
+  // ✅ FIX: Callback per persistere stato su DB (previene Thundering Herd dopo PM2 restart)
+  private persistCallback: CircuitBreakerPersistCallback | null = null;
 
   // Event callbacks
   private eventCallbacks: CircuitBreakerEventCallback[] = [];
@@ -356,6 +362,70 @@ export class CircuitBreaker {
   }
 
   // ==========================================
+  // PERSISTENCE (Previene Thundering Herd dopo PM2 restart)
+  // ==========================================
+
+  /**
+   * ✅ FIX: Imposta callback per persistere stato su DB
+   * Chiamato dal servizio WhatsApp per collegare il CB al database
+   */
+  setPersistenceCallback(callback: CircuitBreakerPersistCallback): void {
+    this.persistCallback = callback;
+    this.logger.log('Persistence callback configured');
+  }
+
+  /**
+   * ✅ FIX: Carica stato persistito dal DB
+   * Chiamato all'avvio per recuperare stato CB dopo PM2 restart
+   *
+   * @param persistedState Lo stato letto dal database
+   */
+  loadPersistedState(persistedState: string | null): void {
+    if (!persistedState) {
+      this.logger.log('No persisted state found, starting with CLOSED');
+      return;
+    }
+
+    // Recupera solo se era OPEN (per prevenire Thundering Herd)
+    if (persistedState === CircuitState.OPEN) {
+      this.state = CircuitState.OPEN;
+      this.lastStateChange = Date.now();
+
+      // Avvia timer per transizione a HALF_OPEN
+      this.scheduleReset();
+
+      this.logger.warn(`Loaded persisted state: OPEN - scheduling reset in ${this.config.resetTimeout}ms`);
+    } else if (persistedState === CircuitState.HALF_OPEN) {
+      // Se era HALF_OPEN, parti da HALF_OPEN
+      this.state = CircuitState.HALF_OPEN;
+      this.lastStateChange = Date.now();
+      this.successCount = 0;
+      this.halfOpenAttempts = 0;
+
+      this.logger.log('Loaded persisted state: HALF_OPEN - testing recovery');
+    } else {
+      this.logger.log(`Loaded persisted state: ${persistedState} - starting with CLOSED`);
+    }
+  }
+
+  /**
+   * ✅ FIX: Persiste lo stato corrente chiamando il callback
+   * Chiamato automaticamente ad ogni cambio di stato
+   */
+  private async persistState(): Promise<void> {
+    if (!this.persistCallback) {
+      return; // Nessun callback configurato, skip
+    }
+
+    try {
+      await this.persistCallback(this.state);
+    } catch (error: any) {
+      this.logger.warn(`Failed to persist state: ${error?.message || error}`);
+      // Non bloccare l'operazione se la persistenza fallisce
+    }
+  }
+
+  // ==========================================
   // EVENT HANDLING
   // ==========================================
 
@@ -436,6 +506,11 @@ export class CircuitBreaker {
     this.logger.log(`State transition: ${previousState} -> ${newState} (reason: ${reason})`);
 
     this.emitEvent('state_change', { previousState, reason });
+
+    // ✅ FIX: Persisti stato dopo ogni transizione (previene Thundering Herd dopo PM2 restart)
+    this.persistState().catch(() => {
+      // Errore già loggato in persistState, ignora qui
+    });
   }
 
   /**

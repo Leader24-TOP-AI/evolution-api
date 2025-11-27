@@ -317,6 +317,18 @@ export class BaileysStartupService extends ChannelStartupService {
     if (this.circuitBreaker && instance.instanceName) {
       this.circuitBreaker.updateName(instance.instanceName);
       this.logger.info(`[SetInstance] Circuit Breaker name updated to: ${instance.instanceName}`);
+
+      // ✅ FIX: Configura persistenza CB per prevenire Thundering Herd dopo PM2 restart
+      this.circuitBreaker.setPersistenceCallback(async (state) => {
+        if (this.instanceId) {
+          // Usa updateMany per evitare errori se il record non esiste ancora
+          // Il record viene creato dal primo heartbeat, qui solo aggiorniamo circuitState
+          await this.prismaRepository.watchdogHeartbeat.updateMany({
+            where: { instanceId: this.instanceId },
+            data: { circuitState: state },
+          });
+        }
+      });
     }
 
     if (this.resourceRegistry && instance.instanceName) {
@@ -684,7 +696,8 @@ export class BaileysStartupService extends ChannelStartupService {
       this.lastConnectionState = 'close';
 
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
+      // ✅ FIX: Aggiunto 440 (session replaced) per evitare retry infinito con auth invalido
+      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406, 440];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
 
       if (shouldReconnect) {
@@ -2044,12 +2057,26 @@ export class BaileysStartupService extends ChannelStartupService {
           // ✅ FIX HTTP TIMEOUT: Proxy list fetch con timeout 15s
           const response = await withHttpTimeout(axios.get(this.localProxy?.host), 'proxyListFetch');
           const text = response.data;
-          const proxyUrls = text.split('\r\n');
-          const rand = Math.floor(Math.random() * Math.floor(proxyUrls.length));
-          const proxyUrl = 'http://' + proxyUrls[rand];
-          options = { agent: makeProxyAgent(proxyUrl), fetchAgent: makeProxyAgentUndici(proxyUrl) };
-        } catch {
-          this.localProxy.enabled = false;
+          // ✅ FIX: Filtra URL vuoti per evitare errori con lista vuota
+          const proxyUrls = text.split('\r\n').filter((url: string) => url.trim().length > 0);
+
+          // ✅ FIX: Validare lista non vuota prima di usarla
+          if (proxyUrls.length === 0) {
+            this.logger.warn(
+              `[Proxy] Instance ${this.instance.name} - Proxy list empty from proxyscrape, keeping previous config`,
+            );
+            // NON disabilitare proxy, mantiene configurazione precedente
+          } else {
+            const rand = Math.floor(Math.random() * proxyUrls.length);
+            const proxyUrl = 'http://' + proxyUrls[rand];
+            options = { agent: makeProxyAgent(proxyUrl), fetchAgent: makeProxyAgentUndici(proxyUrl) };
+          }
+        } catch (error: any) {
+          // ✅ FIX: NON disabilitare proxy permanentemente su errore
+          this.logger.warn(
+            `[Proxy] Instance ${this.instance.name} - Proxy fetch error: ${error?.message || error}, keeping previous config`,
+          );
+          // RIMOSSO: this.localProxy.enabled = false;
         }
       } else {
         options = {
@@ -2090,6 +2117,7 @@ export class BaileysStartupService extends ChannelStartupService {
       fireInitQueries: true,
       connectTimeoutMs: 30_000,
       keepAliveIntervalMs: 30_000,
+      keepAliveTimeoutMs: 10_000, // ✅ FIX: Timeout per rilevare socket stale (no pong response)
       qrTimeout: 45_000,
       emitOwnEvents: false,
       shouldIgnoreJid: (jid) => {
@@ -2163,6 +2191,22 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
     try {
+      // ✅ FIX: Carica stato Circuit Breaker persistito per prevenire Thundering Herd dopo PM2 restart
+      if (this.instanceId) {
+        try {
+          const heartbeat = await this.prismaRepository.watchdogHeartbeat.findUnique({
+            where: { instanceId: this.instanceId },
+            select: { circuitState: true },
+          });
+          if (heartbeat?.circuitState) {
+            this.circuitBreaker.loadPersistedState(heartbeat.circuitState);
+          }
+        } catch (err: any) {
+          this.logger.warn(`[ConnectToWhatsapp] Failed to load persisted CB state: ${err?.message || err}`);
+          // Non bloccare la connessione se il caricamento fallisce
+        }
+      }
+
       this.loadChatwoot();
       this.loadSettings();
       this.loadWebhook();
