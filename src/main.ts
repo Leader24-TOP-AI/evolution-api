@@ -174,49 +174,65 @@ async function bootstrap() {
     });
 
     // Chiudere istanze WhatsApp con timeout
-    const shutdownTimeout = 30000; // 30 secondi max per shutdown
-    const instanceTimeout = 5000; // 5 secondi max per istanza
-    const shutdownStart = Date.now();
+    const shutdownTimeout = 30000; // 30 secondi max per shutdown globale
+    const instanceTimeout = 10000; // ✅ FIX: Aumentato da 5s a 10s per istanza
 
     try {
       const instanceNames = Object.keys(waMonitor.waInstances);
-      logger.info(`Closing ${instanceNames.length} WhatsApp instance(s)...`);
+      logger.info(`Closing ${instanceNames.length} WhatsApp instance(s) in parallel...`);
 
-      for (const name of instanceNames) {
-        // Check timeout globale
-        if (Date.now() - shutdownStart > shutdownTimeout) {
-          logger.warn('Shutdown timeout reached, forcing exit');
-          break;
-        }
-
-        try {
-          const instance = waMonitor.waInstances[name];
-
-          // ✅ FIX: Cleanup ResourceRegistry PRIMA di chiudere il client
-          if (instance?.resourceRegistry) {
-            const cleanupResult = instance.resourceRegistry.cleanupAll('graceful_shutdown');
-            logger.info(
-              `Instance ${name} resources cleaned: ${cleanupResult.total} ` +
-                `(${cleanupResult.timers} timers, ${cleanupResult.listeners} listeners, ${cleanupResult.processes} processes)`,
-            );
-          }
-
-          // ✅ FIX: Timeout individuale su client.end() per evitare blocchi
-          if (instance?.client) {
+      // ✅ FIX: Chiusura PARALLELA invece di sequenziale
+      // Con 20 istanze sequenziali a 5s = 100s, ma timeout globale era 30s
+      // Con parallelo, tutte le istanze vengono chiuse contemporaneamente
+      const closeResults = await Promise.race([
+        Promise.allSettled(
+          instanceNames.map(async (name) => {
             try {
-              await Promise.race([
-                instance.client.end('shutdown'),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('client.end timeout')), instanceTimeout)),
-              ]);
+              const instance = waMonitor.waInstances[name];
+
+              // ✅ FIX: Skip istanze ancora in fase di creazione (non hanno client completo)
+              if (instance?.lastConnectionState === 'connecting') {
+                logger.info(`Instance ${name} still connecting, skipping graceful close`);
+                return { name, status: 'skipped', reason: 'connecting' };
+              }
+
+              // Cleanup ResourceRegistry PRIMA di chiudere il client
+              if (instance?.resourceRegistry) {
+                const cleanupResult = instance.resourceRegistry.cleanupAll('graceful_shutdown');
+                logger.info(
+                  `Instance ${name} resources cleaned: ${cleanupResult.total} ` +
+                    `(${cleanupResult.timers} timers, ${cleanupResult.listeners} listeners, ${cleanupResult.processes} processes)`,
+                );
+              }
+
+              // Timeout individuale su client.end() per evitare blocchi
+              if (instance?.client) {
+                await Promise.race([
+                  instance.client.end('shutdown'),
+                  new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('client.end timeout')), instanceTimeout),
+                  ),
+                ]);
+              }
               logger.info(`Instance ${name} closed`);
-            } catch (endError: any) {
-              logger.warn(`Instance ${name} end timeout/error: ${endError.message}, forcing cleanup`);
+              return { name, status: 'closed' };
+            } catch (e: any) {
+              logger.warn(`Instance ${name} close error: ${e.message}`);
+              return { name, status: 'error', error: e.message };
             }
-          }
-        } catch (e: any) {
-          logger.error(`Error closing instance ${name}: ${e.message}`);
-        }
-      }
+          }),
+        ),
+        // Timeout globale come safety net
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('global shutdown timeout')), shutdownTimeout),
+        ),
+      ]);
+
+      // Log risultati
+      const closed = closeResults.filter((r) => r.status === 'fulfilled' && r.value?.status === 'closed').length;
+      const skipped = closeResults.filter((r) => r.status === 'fulfilled' && r.value?.status === 'skipped').length;
+      const errors = closeResults.filter((r) => r.status === 'rejected' || r.value?.status === 'error').length;
+      logger.info(`Shutdown results: ${closed} closed, ${skipped} skipped, ${errors} errors`);
 
       // Disconnettere DB con timeout
       const dbDisconnectTimeout = 10000; // 10 secondi max per DB disconnect

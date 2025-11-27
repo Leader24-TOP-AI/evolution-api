@@ -390,6 +390,9 @@ export class BaileysStartupService extends ChannelStartupService {
   // ✅ FIX: Funzione per unsubscribe dal circuit breaker (evita memory leak)
   private circuitBreakerUnsubscribe: (() => void) | null = null;
 
+  // ✅ FIX: Funzione per unsubscribe dall'event processor Baileys (evita memory leak)
+  private eventProcessUnsubscribe: (() => void) | null = null;
+
   // ✅ DEFENSE IN DEPTH - Hard limits per prevenire loop infiniti
   private readonly HARD_MAX_RESTART_ATTEMPTS = 20; // Limite assoluto restart
   private readonly HARD_MAX_RECURSION_DEPTH = 3; // Limite recursione safety timeout
@@ -1296,6 +1299,19 @@ export class BaileysStartupService extends ChannelStartupService {
         } catch (wsError) {
           this.logger.warn(`[Cleanup] Instance ${this.instance.name} - WebSocket close error: ${wsError.message}`);
         }
+      }
+
+      // ✅ FIX: Rimuovi event processor listener PRIMA di chiudere il client (evita memory leak)
+      if (this.eventProcessUnsubscribe) {
+        this.logger.verbose(`[Cleanup] Instance ${this.instance.name} - Unsubscribing event processor`);
+        try {
+          this.eventProcessUnsubscribe();
+        } catch (unsubError) {
+          this.logger.warn(
+            `[Cleanup] Instance ${this.instance.name} - Event processor unsubscribe error: ${unsubError.message}`,
+          );
+        }
+        this.eventProcessUnsubscribe = null;
       }
 
       // 2. Termina il client Baileys
@@ -3298,7 +3314,8 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler() {
-    this.client.ev.process(async (events) => {
+    // ✅ FIX: Salva la funzione di unsubscribe per evitare memory leak
+    this.eventProcessUnsubscribe = this.client.ev.process(async (events) => {
       // ✅ FIX CRITICO: Try/catch per prevenire crash dell'event processor
       // Se un handler lancia un'eccezione, l'intero event processor si blocca
       try {
