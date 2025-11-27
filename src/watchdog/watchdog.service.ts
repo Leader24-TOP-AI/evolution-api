@@ -212,6 +212,16 @@ export class WatchdogService {
           continue;
         }
 
+        // ✅ FIX INTERAZIONE 3: Skip if internal restart is in progress
+        // The instance signals this by setting circuitState to 'RESTARTING'
+        if (heartbeat.circuitState === 'RESTARTING') {
+          this.log(
+            'INFO',
+            `Instance ${instance.name} - Internal restart in progress (circuitState=RESTARTING), skipping watchdog recovery`,
+          );
+          continue;
+        }
+
         // SCENARIO 2: Heartbeat too old (process frozen or dead)
         if (heartbeat.lastHeartbeat < heartbeatCutoff) {
           const stuckDuration = now.getTime() - heartbeat.lastHeartbeat.getTime();

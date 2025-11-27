@@ -346,6 +346,12 @@ export class BaileysStartupService extends ChannelStartupService {
   private isAutoRestartTriggered: boolean = false;
   // ✅ FIX DEFINITIVO: Nuovo flag per prevenire race conditions senza bloccare timer
   private isRestartInProgress: boolean = false;
+  // ✅ FIX INTERAZIONE 1: Lock timestamp per rendere atomico isRestartInProgress
+  private restartLockTimestamp: number = 0;
+  private readonly RESTART_LOCK_TIMEOUT = 120000; // 2 minuti max per un restart
+
+  // ✅ FIX INTERAZIONE 6: Flag per evitare healthCheck durante cleanup
+  private isCleaningUp: boolean = false;
 
   // ✅ FASE 2: Health Check System
   private healthCheckTimer: NodeJS.Timeout | null = null;
@@ -408,6 +414,53 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public get connectionStatus() {
     return this.stateConnection;
+  }
+
+  /**
+   * ✅ FIX INTERAZIONE 1: Mutex atomico per isRestartInProgress
+   * Previene race conditions tra autoRestart, forceRestart, e watchdog recovery
+   * Ritorna true se il lock è stato acquisito, false se già locked da altro processo
+   */
+  private tryAcquireRestartLock(caller: string): boolean {
+    const now = Date.now();
+
+    // Se c'è un lock attivo E non è scaduto, rifiuta
+    if (this.isRestartInProgress && now - this.restartLockTimestamp < this.RESTART_LOCK_TIMEOUT) {
+      this.logger.warn(
+        `[RestartLock] Instance ${this.instance.name} - Lock acquisition DENIED for '${caller}'. ` +
+          `Lock held for ${Math.round((now - this.restartLockTimestamp) / 1000)}s (max ${this.RESTART_LOCK_TIMEOUT / 1000}s)`,
+      );
+      return false;
+    }
+
+    // Se il lock è scaduto, log warning e procedi
+    if (this.isRestartInProgress && now - this.restartLockTimestamp >= this.RESTART_LOCK_TIMEOUT) {
+      this.logger.error(
+        `[RestartLock] Instance ${this.instance.name} - ⚠️ STALE LOCK detected! ` +
+          `Lock was held for ${Math.round((now - this.restartLockTimestamp) / 1000)}s (exceeded ${this.RESTART_LOCK_TIMEOUT / 1000}s limit). ` +
+          `Forcing acquisition for '${caller}'.`,
+      );
+      // Record failure in circuit breaker - stale lock indica problema
+      this.circuitBreaker.recordFailure('stale_restart_lock_detected');
+    }
+
+    // Acquisisci il lock atomicamente
+    this.isRestartInProgress = true;
+    this.restartLockTimestamp = now;
+    this.logger.info(`[RestartLock] Instance ${this.instance.name} - Lock ACQUIRED by '${caller}'`);
+    return true;
+  }
+
+  /**
+   * ✅ FIX INTERAZIONE 1: Rilascia il lock di restart
+   */
+  private releaseRestartLock(caller: string): void {
+    const holdTime = Date.now() - this.restartLockTimestamp;
+    this.isRestartInProgress = false;
+    this.restartLockTimestamp = 0;
+    this.logger.info(
+      `[RestartLock] Instance ${this.instance.name} - Lock RELEASED by '${caller}' (held for ${holdTime}ms)`,
+    );
   }
 
   public async logoutInstance() {
@@ -921,12 +974,9 @@ export class BaileysStartupService extends ChannelStartupService {
     const restartStartTime = Date.now();
 
     try {
-      // ✅ FIX: Previeni chiamate duplicate usando isRestartInProgress
-      if (this.isRestartInProgress) {
-        this.logger.warn(
-          `[Auto-Restart] Instance ${this.instance.name} - Restart already in progress, skipping duplicate call`,
-        );
-        return;
+      // ✅ FIX INTERAZIONE 1: Usa mutex atomico invece di check + set separati
+      if (!this.tryAcquireRestartLock('autoRestart')) {
+        return; // Lock già acquisito da altro processo
       }
 
       // ✅ DEFENSE IN DEPTH - Layer 2: Check Circuit Breaker PRIMA di tutto
@@ -934,6 +984,7 @@ export class BaileysStartupService extends ChannelStartupService {
         this.logger.error(
           `[Auto-Restart] Instance ${this.instance.name} - ❌ Circuit Breaker is ${this.circuitBreaker.getState()}, refusing restart`,
         );
+        this.releaseRestartLock('autoRestart-circuit_breaker_refused');
         return;
       }
 
@@ -944,6 +995,7 @@ export class BaileysStartupService extends ChannelStartupService {
           `[Auto-Restart] Instance ${this.instance.name} - ❌ HARD LIMIT: ${this.globalRestartCounter} restarts in ${this.GLOBAL_RESTART_WINDOW / 1000}s window. Tripping circuit breaker.`,
         );
         this.circuitBreaker.tripCircuit('exceeded_global_restart_limit');
+        this.releaseRestartLock('autoRestart-global_limit_exceeded');
         return;
       }
 
@@ -953,10 +1005,10 @@ export class BaileysStartupService extends ChannelStartupService {
           `[Auto-Restart] Instance ${this.instance.name} - ❌ HARD LIMIT: ${this.autoRestartAttempts} attempts reached. Tripping circuit breaker.`,
         );
         this.circuitBreaker.tripCircuit('exceeded_hard_max_attempts');
+        this.releaseRestartLock('autoRestart-hard_max_exceeded');
         return;
       }
 
-      this.isRestartInProgress = true; // ← Lock per prevenire duplicati
       this.isAutoRestartTriggered = true;
       this.autoRestartAttempts++;
 
@@ -971,7 +1023,7 @@ export class BaileysStartupService extends ChannelStartupService {
         this.logger.error(
           `[Auto-Restart] Instance ${this.instance.name} - ❌ Cannot restart: state is 'close' (definitively closed)`,
         );
-        this.isRestartInProgress = false;
+        this.releaseRestartLock('autoRestart-state_is_close');
         this.isAutoRestartTriggered = false;
         return;
       }
@@ -997,7 +1049,7 @@ export class BaileysStartupService extends ChannelStartupService {
         this.logger.error(
           `[Auto-Restart] Instance ${this.instance.name} - ❌ Timeout: state did not become 'close' within 5s. Current state: ${this.stateConnection.state}`,
         );
-        this.isRestartInProgress = false;
+        this.releaseRestartLock('autoRestart-waitForState_timeout');
         this.isAutoRestartTriggered = false;
         return;
       }
@@ -1034,8 +1086,15 @@ export class BaileysStartupService extends ChannelStartupService {
         `[Auto-Restart] Instance ${this.instance.name} - ✅ Client creation completed in ${restartDuration}ms. Waiting for connection state update...`,
       );
 
+      // ✅ FIX INTERAZIONE 4: Avvia heartbeat SUBITO dopo createClient per permettere al watchdog
+      // di monitorare l'istanza anche durante 'connecting'. Se rimane bloccata, il watchdog può rilevarla.
+      this.startHeartbeat();
+      this.logger.info(
+        `[Auto-Restart] Instance ${this.instance.name} - Heartbeat restarted for watchdog monitoring during connecting phase`,
+      );
+
       // Reset lock dopo creazione client
-      this.isRestartInProgress = false;
+      this.releaseRestartLock('autoRestart-createClient_success');
 
       // ✅ FIX: Safety timeout migliorato - Non solo reset flag ma TRIGGERA riconnessione attiva
       if (this.safetyTimeout) {
@@ -1131,7 +1190,7 @@ export class BaileysStartupService extends ChannelStartupService {
       // Reset flag su errore (preserva wasOpenBeforeReconnect per future riconnessioni)
       this.isAutoRestarting = false;
       this.isAutoRestartTriggered = false;
-      this.isRestartInProgress = false;
+      this.releaseRestartLock('autoRestart-exception');
 
       // ✅ FIX BUG #4: wasOpenBeforeReconnect NON viene resettato qui
       // Preservato per permettere recovery automatico su prossima riconnessione
@@ -1143,13 +1202,11 @@ export class BaileysStartupService extends ChannelStartupService {
         this.safetyTimeout = null;
       }
     } finally {
-      // ✅ FIX #1: SEMPRE resetta isRestartInProgress per evitare deadlock
-      // Questo garantisce che anche in caso di eccezioni non catturate, il flag viene resettato
-      if (this.isRestartInProgress) {
-        this.logger.warn(
-          `[Auto-Restart] Instance ${this.instance.name} - Finally block: ensuring isRestartInProgress=false`,
-        );
-        this.isRestartInProgress = false;
+      // ✅ FIX INTERAZIONE 1: Il finally block ora rilascia il lock solo se ancora tenuto
+      // Questo garantisce che anche in caso di eccezioni non catturate, il lock viene rilasciato
+      if (this.isRestartInProgress && this.restartLockTimestamp > 0) {
+        this.logger.warn(`[Auto-Restart] Instance ${this.instance.name} - Finally block: releasing stale lock`);
+        this.releaseRestartLock('autoRestart-finally_cleanup');
       }
     }
     // NOTA: isAutoRestarting viene resettato PRIMA di chiamare createClient (fix deadlock)
@@ -1226,6 +1283,9 @@ export class BaileysStartupService extends ChannelStartupService {
     const startTime = Date.now();
     this.logger.info(`[Cleanup] Instance ${this.instance.name} - Starting complete client cleanup (reason: ${reason})`);
 
+    // ✅ FIX INTERAZIONE 6: Setta flag per evitare che healthCheck operi durante cleanup
+    this.isCleaningUp = true;
+
     try {
       // 1. Chiudi WebSocket se aperto
       if (this.client?.ws) {
@@ -1273,6 +1333,9 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.info(`[Cleanup] Instance ${this.instance.name} - Client cleanup completed in ${cleanupDuration}ms`);
     } catch (error) {
       this.logger.error(`[Cleanup] Instance ${this.instance.name} - Error during cleanup: ${error.toString()}`);
+    } finally {
+      // ✅ FIX INTERAZIONE 6: Reset flag cleanup - SEMPRE, anche in caso di errore
+      this.isCleaningUp = false;
     }
   }
 
@@ -1368,6 +1431,10 @@ export class BaileysStartupService extends ChannelStartupService {
    */
   private async updateHeartbeat() {
     try {
+      // ✅ FIX INTERAZIONE 3: Se un restart interno è in corso, segnalalo al watchdog
+      // usando circuitState='RESTARTING' così il watchdog non interviene
+      const effectiveCircuitState = this.isRestartInProgress ? 'RESTARTING' : this.circuitBreaker.getState();
+
       await withDbTimeout(
         this.prismaRepository.watchdogHeartbeat.upsert({
           where: { instanceId: this.instanceId },
@@ -1375,14 +1442,14 @@ export class BaileysStartupService extends ChannelStartupService {
             lastHeartbeat: new Date(),
             state: this.stateConnection.state,
             processId: process.pid,
-            circuitState: this.circuitBreaker.getState(),
+            circuitState: effectiveCircuitState,
           },
           create: {
             instanceId: this.instanceId,
             lastHeartbeat: new Date(),
             state: this.stateConnection.state,
             processId: process.pid,
-            circuitState: this.circuitBreaker.getState(),
+            circuitState: effectiveCircuitState,
             recoveryAttempts: 0,
           },
         }),
@@ -1428,6 +1495,13 @@ export class BaileysStartupService extends ChannelStartupService {
    * Esegue un controllo di salute dell'istanza
    */
   private async performHealthCheck() {
+    // ✅ FIX INTERAZIONE 6: Skip health check se cleanup in corso
+    // Evita operazioni su client in fase di distruzione
+    if (this.isCleaningUp) {
+      this.logger.verbose(`[HealthCheck] Instance ${this.instance.name} - Skipping: cleanup in progress`);
+      return;
+    }
+
     const state = this.stateConnection.state;
     const now = Date.now();
     const stateAge = now - this.lastStateChangeTimestamp;
@@ -1640,11 +1714,18 @@ export class BaileysStartupService extends ChannelStartupService {
     const restartStartTime = Date.now();
 
     try {
-      // ✅ FIX: Previeni race condition - usa isRestartInProgress invece di isAutoRestarting
-      if (this.isRestartInProgress) {
-        this.logger.warn(
-          `[ForceRestart] Instance ${this.instance.name} - Restart already in progress, skipping duplicate call`,
+      // ✅ FIX INTERAZIONE 1: Usa mutex atomico invece di check + set separati
+      if (!this.tryAcquireRestartLock('forceRestart')) {
+        return; // Lock già acquisito da altro processo
+      }
+
+      // ✅ FIX INTERAZIONE 2: Check Circuit Breaker ANCHE in forceRestart (come autoRestart)
+      // CRITICO: Prima forceRestart ignorava il Circuit Breaker, causando bypass della protezione
+      if (!this.circuitBreaker.canExecute()) {
+        this.logger.error(
+          `[ForceRestart] Instance ${this.instance.name} - ❌ Circuit Breaker is ${this.circuitBreaker.getState()}, refusing restart`,
         );
+        this.releaseRestartLock('forceRestart-circuit_breaker_refused');
         return;
       }
 
@@ -1667,8 +1748,6 @@ export class BaileysStartupService extends ChannelStartupService {
         this.logger.info(`[ForceRestart] Instance ${this.instance.name} - Cleared existing safetyTimeout`);
       }
 
-      // Lock per prevenire chiamate duplicate
-      this.isRestartInProgress = true;
       this.isAutoRestartTriggered = true;
 
       // ✅ FIX #0 BUG BLOCCO PERMANENTE: Cattura stato 'open' PRIMA del cleanup
@@ -1696,7 +1775,7 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.error(
             `[ForceRestart] Instance ${this.instance.name} - ❌ Timeout waiting for 'close'. Current state: ${this.stateConnection.state}`,
           );
-          this.isRestartInProgress = false;
+          this.releaseRestartLock('forceRestart-waitForState_timeout');
           return;
         }
       }
@@ -1738,8 +1817,15 @@ export class BaileysStartupService extends ChannelStartupService {
         `[ForceRestart] Instance ${this.instance.name} - ✅ Client creation completed in ${restartDuration}ms`,
       );
 
+      // ✅ FIX INTERAZIONE 4: Avvia heartbeat SUBITO dopo createClient per permettere al watchdog
+      // di monitorare l'istanza anche durante 'connecting'. Se rimane bloccata, il watchdog può rilevarla.
+      this.startHeartbeat();
+      this.logger.info(
+        `[ForceRestart] Instance ${this.instance.name} - Heartbeat restarted for watchdog monitoring during connecting phase`,
+      );
+
       // Reset lock
-      this.isRestartInProgress = false;
+      this.releaseRestartLock('forceRestart-createClient_success');
 
       // ✅ FIX: Safety timeout migliorato (identico a autoRestart)
       if (this.safetyTimeout) {
@@ -1819,7 +1905,7 @@ export class BaileysStartupService extends ChannelStartupService {
       // Reset flag su errore (preserva wasOpenBeforeReconnect per future riconnessioni)
       this.isAutoRestarting = false;
       this.isAutoRestartTriggered = false;
-      this.isRestartInProgress = false;
+      this.releaseRestartLock('forceRestart-exception');
 
       // ✅ FIX BUG #2: wasOpenBeforeReconnect NON viene resettato qui
       // Preservato per permettere recovery automatico su prossima riconnessione
@@ -1831,13 +1917,11 @@ export class BaileysStartupService extends ChannelStartupService {
         this.safetyTimeout = null;
       }
     } finally {
-      // ✅ FIX #1: SEMPRE resetta isRestartInProgress per evitare deadlock
-      // Questo garantisce che anche in caso di eccezioni non catturate, il flag viene resettato
-      if (this.isRestartInProgress) {
-        this.logger.warn(
-          `[ForceRestart] Instance ${this.instance.name} - Finally block: ensuring isRestartInProgress=false`,
-        );
-        this.isRestartInProgress = false;
+      // ✅ FIX INTERAZIONE 1: Il finally block ora rilascia il lock solo se ancora tenuto
+      // Questo garantisce che anche in caso di eccezioni non catturate, il lock viene rilasciato
+      if (this.isRestartInProgress && this.restartLockTimestamp > 0) {
+        this.logger.warn(`[ForceRestart] Instance ${this.instance.name} - Finally block: releasing stale lock`);
+        this.releaseRestartLock('forceRestart-finally_cleanup');
       }
     }
   }
