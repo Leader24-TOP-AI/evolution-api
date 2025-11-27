@@ -218,9 +218,17 @@ async function bootstrap() {
         }
       }
 
-      // Disconnettere DB
-      await prismaRepository.$disconnect();
-      logger.info('Database disconnected');
+      // Disconnettere DB con timeout
+      const dbDisconnectTimeout = 10000; // 10 secondi max per DB disconnect
+      try {
+        await Promise.race([
+          prismaRepository.$disconnect(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('DB disconnect timeout')), dbDisconnectTimeout)),
+        ]);
+        logger.info('Database disconnected');
+      } catch (dbError: any) {
+        logger.warn(`Database disconnect timeout/error: ${dbError.message}, continuing shutdown`);
+      }
     } catch (e: any) {
       logger.error(`Error during graceful shutdown: ${e.message}`);
     }

@@ -81,7 +81,7 @@ import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 // ✅ DEFENSE IN DEPTH: Import nuove utility per protezione 100%
-import { TimeoutError, withDbTimeout, withRedisTimeout } from '@utils/async-timeout';
+import { TimeoutError, withDbTimeout, withHttpTimeout, withRedisTimeout } from '@utils/async-timeout';
 import { CircuitBreaker } from '@utils/circuit-breaker';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
@@ -1260,8 +1260,10 @@ export class BaileysStartupService extends ChannelStartupService {
         this.safetyTimeout = null;
       }
 
-      // NOTA: NON fermiamo healthCheckTimer qui perché vogliamo che continui
-      // a monitorare anche durante la riconnessione
+      // ✅ FIX CRITICO: Ferma healthCheck e heartbeat durante cleanup
+      // Se non li fermiamo, continuano a operare su un client morto = memory leak + errori
+      this.stopHealthCheck();
+      this.stopHeartbeat();
 
       // 4. Nullifica reference del client (permette garbage collection)
       // NOTA: Non settiamo this.client = null perché createClient() lo sovrascriverà
@@ -1938,7 +1940,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
       if (this.localProxy?.host?.includes('proxyscrape')) {
         try {
-          const response = await axios.get(this.localProxy?.host);
+          // ✅ FIX HTTP TIMEOUT: Proxy list fetch con timeout 15s
+          const response = await withHttpTimeout(axios.get(this.localProxy?.host), 'proxyListFetch');
           const text = response.data;
           const proxyUrls = text.split('\r\n');
           const rand = Math.floor(Math.random() * Math.floor(proxyUrls.length));
@@ -3211,134 +3214,148 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private eventHandler() {
     this.client.ev.process(async (events) => {
-      if (!this.endSession) {
-        const database = this.configService.get<Database>('DATABASE');
-        const settings = await this.findSettings();
+      // ✅ FIX CRITICO: Try/catch per prevenire crash dell'event processor
+      // Se un handler lancia un'eccezione, l'intero event processor si blocca
+      try {
+        if (!this.endSession) {
+          const database = this.configService.get<Database>('DATABASE');
+          const settings = await this.findSettings();
 
-        if (events.call) {
-          const call = events.call[0];
+          if (events.call) {
+            const call = events.call[0];
 
-          if (settings?.rejectCall && call.status == 'offer') {
-            this.client.rejectCall(call.id, call.from);
-          }
-
-          if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
-            if (call.from.endsWith('@lid')) {
-              call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
+            if (settings?.rejectCall && call.status == 'offer') {
+              this.client.rejectCall(call.id, call.from);
             }
-            const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
 
-            this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+            if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
+              if (call.from.endsWith('@lid')) {
+                call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
+              }
+              const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+
+              this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+            }
+
+            this.sendDataWebhook(Events.CALL, call);
           }
 
-          this.sendDataWebhook(Events.CALL, call);
-        }
+          if (events['connection.update']) {
+            // ✅ FIX #9: Await per sequenzializzare eventi e prevenire race conditions
+            await this.connectionUpdate(events['connection.update']);
+          }
 
-        if (events['connection.update']) {
-          // ✅ FIX #9: Await per sequenzializzare eventi e prevenire race conditions
-          await this.connectionUpdate(events['connection.update']);
-        }
+          if (events['creds.update']) {
+            this.instance.authState.saveCreds();
+          }
 
-        if (events['creds.update']) {
-          this.instance.authState.saveCreds();
-        }
+          if (events['messaging-history.set']) {
+            const payload = events['messaging-history.set'];
+            this.messageHandle['messaging-history.set'](payload);
+          }
 
-        if (events['messaging-history.set']) {
-          const payload = events['messaging-history.set'];
-          this.messageHandle['messaging-history.set'](payload);
-        }
+          if (events['messages.upsert']) {
+            const payload = events['messages.upsert'];
 
-        if (events['messages.upsert']) {
-          const payload = events['messages.upsert'];
+            this.messageProcessor.processMessage(payload, settings);
+            // this.messageHandle['messages.upsert'](payload, settings);
+          }
 
-          this.messageProcessor.processMessage(payload, settings);
-          // this.messageHandle['messages.upsert'](payload, settings);
-        }
+          if (events['messages.update']) {
+            const payload = events['messages.update'];
+            this.messageHandle['messages.update'](payload, settings);
+          }
 
-        if (events['messages.update']) {
-          const payload = events['messages.update'];
-          this.messageHandle['messages.update'](payload, settings);
-        }
+          if (events['message-receipt.update']) {
+            const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
+            const remotesJidMap: Record<string, number> = {};
 
-        if (events['message-receipt.update']) {
-          const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
-          const remotesJidMap: Record<string, number> = {};
+            for (const event of payload) {
+              if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
+                remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+              }
+            }
 
-          for (const event of payload) {
-            if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
-              remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+            await Promise.all(
+              Object.keys(remotesJidMap).map(async (remoteJid) =>
+                this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
+              ),
+            );
+          }
+
+          if (events['presence.update']) {
+            const payload = events['presence.update'];
+
+            if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
+              return;
+            }
+
+            this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
+          }
+
+          if (!settings?.groupsIgnore) {
+            if (events['groups.upsert']) {
+              const payload = events['groups.upsert'];
+              this.groupHandler['groups.upsert'](payload);
+            }
+
+            if (events['groups.update']) {
+              const payload = events['groups.update'];
+              this.groupHandler['groups.update'](payload);
+            }
+
+            if (events['group-participants.update']) {
+              const payload = events['group-participants.update'] as any;
+              this.groupHandler['group-participants.update'](payload);
             }
           }
 
-          await Promise.all(
-            Object.keys(remotesJidMap).map(async (remoteJid) =>
-              this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
-            ),
-          );
-        }
+          if (events['chats.upsert']) {
+            const payload = events['chats.upsert'];
+            this.chatHandle['chats.upsert'](payload);
+          }
 
-        if (events['presence.update']) {
-          const payload = events['presence.update'];
+          if (events['chats.update']) {
+            const payload = events['chats.update'];
+            this.chatHandle['chats.update'](payload);
+          }
 
-          if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
+          if (events['chats.delete']) {
+            const payload = events['chats.delete'];
+            this.chatHandle['chats.delete'](payload);
+          }
+
+          if (events['contacts.upsert']) {
+            const payload = events['contacts.upsert'];
+            this.contactHandle['contacts.upsert'](payload);
+          }
+
+          if (events['contacts.update']) {
+            const payload = events['contacts.update'];
+            this.contactHandle['contacts.update'](payload);
+          }
+
+          if (events[Events.LABELS_ASSOCIATION]) {
+            const payload = events[Events.LABELS_ASSOCIATION];
+            this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
             return;
           }
 
-          this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
-        }
-
-        if (!settings?.groupsIgnore) {
-          if (events['groups.upsert']) {
-            const payload = events['groups.upsert'];
-            this.groupHandler['groups.upsert'](payload);
-          }
-
-          if (events['groups.update']) {
-            const payload = events['groups.update'];
-            this.groupHandler['groups.update'](payload);
-          }
-
-          if (events['group-participants.update']) {
-            const payload = events['group-participants.update'] as any;
-            this.groupHandler['group-participants.update'](payload);
+          if (events[Events.LABELS_EDIT]) {
+            const payload = events[Events.LABELS_EDIT];
+            this.labelHandle[Events.LABELS_EDIT](payload);
+            return;
           }
         }
-
-        if (events['chats.upsert']) {
-          const payload = events['chats.upsert'];
-          this.chatHandle['chats.upsert'](payload);
-        }
-
-        if (events['chats.update']) {
-          const payload = events['chats.update'];
-          this.chatHandle['chats.update'](payload);
-        }
-
-        if (events['chats.delete']) {
-          const payload = events['chats.delete'];
-          this.chatHandle['chats.delete'](payload);
-        }
-
-        if (events['contacts.upsert']) {
-          const payload = events['contacts.upsert'];
-          this.contactHandle['contacts.upsert'](payload);
-        }
-
-        if (events['contacts.update']) {
-          const payload = events['contacts.update'];
-          this.contactHandle['contacts.update'](payload);
-        }
-
-        if (events[Events.LABELS_ASSOCIATION]) {
-          const payload = events[Events.LABELS_ASSOCIATION];
-          this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
-          return;
-        }
-
-        if (events[Events.LABELS_EDIT]) {
-          const payload = events[Events.LABELS_EDIT];
-          this.labelHandle[Events.LABELS_EDIT](payload);
-          return;
+      } catch (error) {
+        // ✅ FIX CRITICO: Cattura errori per evitare che l'event processor muoia
+        // Non rilanciare - permettere al processor di continuare con il prossimo evento
+        this.logger.error(
+          `[EventProcessor] Instance ${this.instance.name} - Error processing events: ${error?.message || error}`,
+        );
+        // Log stack trace per debug
+        if (error?.stack) {
+          this.logger.error(`[EventProcessor] Stack: ${error.stack}`);
         }
       }
     });
@@ -3782,10 +3799,14 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       if (this.configService.get<Openai>('OPENAI').ENABLED && messageRaw?.message?.audioMessage) {
-        const openAiDefaultSettings = await this.prismaRepository.openaiSetting.findFirst({
-          where: { instanceId: this.instanceId },
-          include: { OpenaiCreds: true },
-        });
+        // ✅ FIX DB TIMEOUT: Query OpenAI settings con timeout
+        const openAiDefaultSettings = await withDbTimeout(
+          this.prismaRepository.openaiSetting.findFirst({
+            where: { instanceId: this.instanceId },
+            include: { OpenaiCreds: true },
+          }),
+          'sendDataWebhook:openAiSettings',
+        );
 
         if (openAiDefaultSettings && openAiDefaultSettings.openaiCredsId && openAiDefaultSettings.speechToText) {
           messageRaw.message.speechToText = `[audio] ${await this.openaiService.speechToText(messageRaw, this)}`;
@@ -4116,7 +4137,8 @@ export class BaileysStartupService extends ChannelStartupService {
             };
           }
 
-          const response = await axios.get(mediaMessage.media, config);
+          // ✅ FIX HTTP TIMEOUT: Media download con timeout 15s
+          const response = await withHttpTimeout(axios.get(mediaMessage.media, config), 'mediaDownload:image');
           imageBuffer = Buffer.from(response.data, 'binary');
         } else {
           imageBuffer = Buffer.from(mediaMessage.media, 'base64');
@@ -4177,7 +4199,8 @@ export class BaileysStartupService extends ChannelStartupService {
             };
           }
 
-          const response = await axios.get(mediaMessage.media, config);
+          // ✅ FIX HTTP TIMEOUT: Mimetype extraction con timeout 15s
+          const response = await withHttpTimeout(axios.get(mediaMessage.media, config), 'mediaDownload:mimetype');
 
           mimetype = response.headers['content-type'];
         }
@@ -4271,7 +4294,8 @@ export class BaileysStartupService extends ChannelStartupService {
           };
         }
 
-        const response = await axios.get(url, config);
+        // ✅ FIX HTTP TIMEOUT: Sticker image download con timeout 15s
+        const response = await withHttpTimeout(axios.get(url, config), 'stickerDownload');
         imageBuffer = Buffer.from(response.data, 'binary');
       }
 
@@ -4386,7 +4410,8 @@ export class BaileysStartupService extends ChannelStartupService {
     let inputStream: PassThrough;
 
     if (isURL(audio)) {
-      const response = await axios.get(audio, { responseType: 'stream' });
+      // ✅ FIX HTTP TIMEOUT: Audio download stream con timeout 15s
+      const response = await withHttpTimeout(axios.get(audio, { responseType: 'stream' }), 'audioDownload:mp4');
       inputStream = response.data;
     } else {
       const audioBuffer = Buffer.from(audio, 'base64');
@@ -4468,9 +4493,13 @@ export class BaileysStartupService extends ChannelStartupService {
         formData.append('base64', audio);
       }
 
-      const { data } = await axios.post(audioConverterConfig.API_URL, formData, {
-        headers: { ...formData.getHeaders(), apikey: audioConverterConfig.API_KEY },
-      });
+      // ✅ FIX HTTP TIMEOUT: Audio converter API con timeout 30s (operazione lenta)
+      const { data } = await withHttpTimeout(
+        axios.post(audioConverterConfig.API_URL, formData, {
+          headers: { ...formData.getHeaders(), apikey: audioConverterConfig.API_KEY },
+        }),
+        'audioConverter:API',
+      );
 
       if (!data.audio) {
         throw new InternalServerErrorException('Failed to convert audio');
@@ -4489,7 +4518,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const config: any = { responseType: 'stream' };
 
-        const response = await axios.get(url, config);
+        // ✅ FIX HTTP TIMEOUT: Audio stream download con timeout 15s
+        const response = await withHttpTimeout(axios.get(url, config), 'audioDownload:stream');
         inputAudioStream = response.data.pipe(new PassThrough());
       } else {
         const audioBuffer = Buffer.from(audio, 'base64');
@@ -5454,7 +5484,8 @@ export class BaileysStartupService extends ChannelStartupService {
           };
         }
 
-        pic = (await axios.get(url, config)).data;
+        // ✅ FIX HTTP TIMEOUT: User profile picture download con timeout 15s
+        pic = (await withHttpTimeout(axios.get(url, config), 'profilePicDownload:user')).data;
       } else if (isBase64(picture)) {
         pic = Buffer.from(picture, 'base64');
       } else {
@@ -5760,7 +5791,8 @@ export class BaileysStartupService extends ChannelStartupService {
           };
         }
 
-        pic = (await axios.get(url, config)).data;
+        // ✅ FIX HTTP TIMEOUT: Group profile picture download con timeout 15s
+        pic = (await withHttpTimeout(axios.get(url, config), 'profilePicDownload:group')).data;
       } else if (isBase64(picture.image)) {
         pic = Buffer.from(picture.image, 'base64');
       } else {
