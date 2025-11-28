@@ -49,11 +49,11 @@ module.exports = {
       max_memory_restart: '256M',
       env: {
         NODE_ENV: 'production',
-        // Watchdog specific settings
-        WATCHDOG_CHECK_INTERVAL: '60000', // Check every 60 seconds
-        WATCHDOG_HEARTBEAT_TIMEOUT: '90000', // 90s without heartbeat = stuck
-        WATCHDOG_STUCK_TIMEOUT: '120000', // 120s in connecting = stuck
-        WATCHDOG_MAX_ATTEMPTS: '5', // Max recovery attempts before PM2 restart
+        // ✅ OTTIMIZZAZIONE: Tempi ridotti per recovery più veloce (worst case ~2.5 min invece di ~8.5 min)
+        WATCHDOG_CHECK_INTERVAL: '30000', // Check every 30 seconds (era 60000)
+        WATCHDOG_HEARTBEAT_TIMEOUT: '60000', // 60s without heartbeat = stuck (era 90000)
+        WATCHDOG_STUCK_TIMEOUT: '90000', // 90s in connecting = stuck (era 120000)
+        WATCHDOG_MAX_ATTEMPTS: '2', // 2 API attempts, then PM2 restart (era 5)
         WATCHDOG_DEBUG: 'false', // Set to 'true' for verbose logging
         PM2_PROCESS_NAME: 'evolution-api',
       },

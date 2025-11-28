@@ -63,10 +63,11 @@ export class WatchdogService {
 
   constructor(config: Partial<WatchdogConfig> = {}) {
     this.config = {
-      checkInterval: config.checkInterval ?? 60000,
-      heartbeatTimeout: config.heartbeatTimeout ?? 90000,
-      stuckConnectingTimeout: config.stuckConnectingTimeout ?? 120000,
-      maxRecoveryAttempts: config.maxRecoveryAttempts ?? 5,
+      // ✅ OTTIMIZZAZIONE: Tempi ridotti per recovery più veloce (worst case ~2.5 min invece di ~8.5 min)
+      checkInterval: config.checkInterval ?? 30000, // era 60000 - controlla ogni 30s
+      heartbeatTimeout: config.heartbeatTimeout ?? 60000, // era 90000 - rileva dopo 60s
+      stuckConnectingTimeout: config.stuckConnectingTimeout ?? 90000, // era 120000
+      maxRecoveryAttempts: config.maxRecoveryAttempts ?? 2, // era 5 - dopo 2 API restart, PM2 restart
       apiBaseUrl: config.apiBaseUrl ?? process.env.SERVER_URL ?? 'http://localhost:8080',
       apiKey: config.apiKey ?? process.env.AUTHENTICATION_API_KEY ?? '',
       pm2ProcessName: config.pm2ProcessName ?? 'evolution-api',
@@ -304,22 +305,20 @@ export class WatchdogService {
     // Log the recovery attempt
     await this.logRecoveryEvent(instanceId, reason, attempts);
 
-    // ✅ FIX 2.2: Exponential backoff - evita recovery troppo rapidi che non aiutano
-    const backoffMs = Math.min(1000 * Math.pow(2, attempts - 1), 30000); // 1s, 2s, 4s, 8s, 16s, max 30s
+    // ✅ OTTIMIZZAZIONE: Backoff ridotto (max 5s invece di 30s) per recovery più veloce
+    const backoffMs = Math.min(1000 * Math.pow(2, attempts - 1), 5000); // 1s, 2s, 4s, max 5s
     this.log('INFO', `Instance ${instanceName} - Applying backoff delay of ${backoffMs}ms before attempt ${attempts}`);
     await this.sleep(backoffMs);
 
-    // Escalating recovery actions
-    if (attempts <= 2) {
-      // LEVEL 1: API-based restart (gentlest)
+    // ✅ OTTIMIZZAZIONE: Escalation semplificata
+    // - Attempts 1-2: API restart (gentile)
+    // - Attempt 3+: PM2 restart diretto (Force DB Flag rimosso perché inefficace se processo frozen)
+    if (attempts <= this.config.maxRecoveryAttempts) {
+      // API-based restart
       this.log('INFO', `Instance ${instanceName} - Attempting API restart (attempt ${attempts})`);
       await this.restartViaApi(instanceName);
-    } else if (attempts <= this.config.maxRecoveryAttempts) {
-      // LEVEL 2: Force restart via database flag
-      this.log('WARN', `Instance ${instanceName} - Attempting force restart via DB (attempt ${attempts})`);
-      await this.forceRestartViaDb(instanceId, instanceName);
     } else {
-      // LEVEL 3: Nuclear option - restart entire PM2 process
+      // Nuclear option - restart entire PM2 process
       this.log(
         'ERROR',
         `Instance ${instanceName} - Max attempts (${this.config.maxRecoveryAttempts}) exceeded, restarting PM2 process`,

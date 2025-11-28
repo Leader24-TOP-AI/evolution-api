@@ -30,11 +30,12 @@ console.log(`
 `);
 
 // Configuration from environment
+// ✅ OTTIMIZZAZIONE: Nuovi default per recovery più veloce (worst case ~2.5 min invece di ~8.5 min)
 const config = {
-  checkInterval: parseInt(process.env.WATCHDOG_CHECK_INTERVAL || '60000', 10),
-  heartbeatTimeout: parseInt(process.env.WATCHDOG_HEARTBEAT_TIMEOUT || '90000', 10),
-  stuckConnectingTimeout: parseInt(process.env.WATCHDOG_STUCK_TIMEOUT || '120000', 10),
-  maxRecoveryAttempts: parseInt(process.env.WATCHDOG_MAX_ATTEMPTS || '5', 10),
+  checkInterval: parseInt(process.env.WATCHDOG_CHECK_INTERVAL || '30000', 10), // era 60000
+  heartbeatTimeout: parseInt(process.env.WATCHDOG_HEARTBEAT_TIMEOUT || '60000', 10), // era 90000
+  stuckConnectingTimeout: parseInt(process.env.WATCHDOG_STUCK_TIMEOUT || '90000', 10), // era 120000
+  maxRecoveryAttempts: parseInt(process.env.WATCHDOG_MAX_ATTEMPTS || '2', 10), // era 5
   apiBaseUrl: process.env.SERVER_URL || 'http://localhost:8080',
   apiKey: process.env.AUTHENTICATION_API_KEY || '',
   pm2ProcessName: process.env.PM2_PROCESS_NAME || 'evolution-api',
