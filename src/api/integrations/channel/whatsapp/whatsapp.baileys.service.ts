@@ -323,10 +323,14 @@ export class BaileysStartupService extends ChannelStartupService {
         if (this.instanceId) {
           // Usa updateMany per evitare errori se il record non esiste ancora
           // Il record viene creato dal primo heartbeat, qui solo aggiorniamo circuitState
-          await this.prismaRepository.watchdogHeartbeat.updateMany({
-            where: { instanceId: this.instanceId },
-            data: { circuitState: state },
-          });
+          // ✅ FIX: Aggiunto withDbTimeout per coerenza con Layer 1 Timeout Protection
+          await withDbTimeout(
+            this.prismaRepository.watchdogHeartbeat.updateMany({
+              where: { instanceId: this.instanceId },
+              data: { circuitState: state },
+            }),
+            'circuitBreaker:persistState',
+          );
         }
       });
     }
@@ -2211,10 +2215,14 @@ export class BaileysStartupService extends ChannelStartupService {
       // ✅ FIX: Carica stato Circuit Breaker persistito per prevenire Thundering Herd dopo PM2 restart
       if (this.instanceId) {
         try {
-          const heartbeat = await this.prismaRepository.watchdogHeartbeat.findUnique({
-            where: { instanceId: this.instanceId },
-            select: { circuitState: true },
-          });
+          // ✅ FIX: Aggiunto withDbTimeout per coerenza con Layer 1 Timeout Protection
+          const heartbeat = await withDbTimeout(
+            this.prismaRepository.watchdogHeartbeat.findUnique({
+              where: { instanceId: this.instanceId },
+              select: { circuitState: true },
+            }),
+            'connectToWhatsapp:loadCBState',
+          );
           if (heartbeat?.circuitState) {
             this.circuitBreaker.loadPersistedState(heartbeat.circuitState);
           }
