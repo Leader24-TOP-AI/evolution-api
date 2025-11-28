@@ -367,6 +367,62 @@ export class WAMonitoringService {
     this.waInstances[instanceData.instanceName] = instance;
   }
 
+  /**
+   * ✅ LAZY LOADING: Carica un'istanza dal database in memoria on-demand
+   * Usato quando un utente prova a connettersi a un'istanza che esiste nel DB
+   * ma non è in memoria (es. dopo logout + server restart)
+   *
+   * NOTA: NON chiama connectToWhatsapp - il controller lo farà dopo
+   */
+  public async loadInstanceOnDemand(instanceName: string): Promise<void> {
+    // Cerca l'istanza nel database
+    const dbInstance = await this.prismaRepository.instance.findUnique({
+      where: { name: instanceName },
+    });
+
+    if (!dbInstance) {
+      throw new Error(`Instance "${instanceName}" not found in database`);
+    }
+
+    const instanceData: InstanceDto = {
+      instanceName: dbInstance.name,
+      instanceId: dbInstance.id,
+      integration: dbInstance.integration,
+      token: dbInstance.token,
+      number: dbInstance.number,
+      businessId: dbInstance.businessId,
+    };
+
+    // Inizializza il channel (stesso pattern di setInstance)
+    const instance = channelController.init(instanceData, {
+      configService: this.configService,
+      eventEmitter: this.eventEmitter,
+      prismaRepository: this.prismaRepository,
+      cache: this.cache,
+      chatwootCache: this.chatwootCache,
+      baileysCache: this.baileysCache,
+      providerFiles: this.providerFiles,
+    });
+
+    if (!instance) {
+      throw new Error(`Failed to initialize channel for instance "${instanceName}"`);
+    }
+
+    instance.setInstance({
+      instanceId: instanceData.instanceId,
+      instanceName: instanceData.instanceName,
+      integration: instanceData.integration,
+      token: instanceData.token,
+      number: instanceData.number,
+      businessId: instanceData.businessId,
+    });
+
+    // Aggiungi all'array in memoria (NON connettere - lo farà il controller)
+    this.waInstances[instanceName] = instance;
+
+    this.logger.info(`[LazyLoad] Instance "${instanceName}" loaded on-demand from database`);
+  }
+
   private async loadInstancesFromRedis() {
     const keys = await this.cache.keys();
 

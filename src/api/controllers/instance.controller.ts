@@ -294,12 +294,37 @@ export class InstanceController {
 
   public async connectToWhatsapp({ instanceName, number = null }: InstanceDto) {
     try {
-      const instance = this.waMonitor.waInstances[instanceName];
-      const state = instance?.connectionStatus?.state;
+      let instance = this.waMonitor.waInstances[instanceName];
 
-      if (!state) {
-        throw new BadRequestException('The "' + instanceName + '" instance does not exist');
+      // ✅ LAZY LOADING: Se l'istanza non è in memoria, prova a caricarla dal DB
+      // Questo risolve il caso: logout volontario + server restart → utente vuole riconnettersi
+      if (!instance) {
+        // Verifica se esiste nel database
+        const dbInstance = await this.prismaRepository.instance.findUnique({
+          where: { name: instanceName },
+        });
+
+        if (!dbInstance) {
+          throw new BadRequestException('The "' + instanceName + '" instance does not exist');
+        }
+
+        // Reset definitiveLogout per permettere riconnessione
+        await this.prismaRepository.instance.update({
+          where: { name: instanceName },
+          data: { definitiveLogout: false },
+        });
+
+        // Carica l'istanza in memoria
+        this.logger.info(`[LazyLoad] Instance "${instanceName}" not in memory, loading from DB...`);
+        await this.waMonitor.loadInstanceOnDemand(instanceName);
+        instance = this.waMonitor.waInstances[instanceName];
+
+        if (!instance) {
+          throw new BadRequestException('Failed to load instance "' + instanceName + '" from database');
+        }
       }
+
+      const state = instance?.connectionStatus?.state;
 
       if (state == 'open') {
         return await this.connectionState({ instanceName });
