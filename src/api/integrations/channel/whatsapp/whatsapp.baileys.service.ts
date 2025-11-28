@@ -716,10 +716,24 @@ export class BaileysStartupService extends ChannelStartupService {
       this.lastConnectionState = 'close';
 
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      // ✅ FIX: Aggiunto 440 (session replaced) e 408 (timeout) per evitare retry infinito
-      // 408 = Request Timeout - riconnettersi immediatamente causa loop infinito per nuove istanze
-      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406, 408, 440];
-      const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+      // Codici che NON devono MAI riconnettersi (logout reale, session sostituita, etc.)
+      const codesToNeverReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406, 440];
+      let shouldReconnect = !codesToNeverReconnect.includes(statusCode);
+
+      // 408 = Request Timeout - recuperabile SOLO se l'istanza era già connessa
+      // Per nuove istanze (QR scan), 408 indica problema iniziale → no retry (evita loop infinito)
+      if (statusCode === 408) {
+        shouldReconnect = wasOpenBeforeClose;
+        if (shouldReconnect) {
+          this.logger.info(
+            `[Connection] Instance ${this.instance.name} - 408 Timeout but was connected before - will attempt reconnect`,
+          );
+        } else {
+          this.logger.warn(
+            `[Connection] Instance ${this.instance.name} - 408 Timeout during initial connection - treating as definitive`,
+          );
+        }
+      }
 
       if (shouldReconnect) {
         // Se era 'open' e stiamo per riconnettere, potrebbe essere un cambio IP proxy
