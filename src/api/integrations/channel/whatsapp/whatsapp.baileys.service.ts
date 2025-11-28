@@ -82,7 +82,7 @@ import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 // ✅ DEFENSE IN DEPTH: Import nuove utility per protezione 100%
 import { TimeoutError, withDbTimeout, withHttpTimeout, withRedisTimeout } from '@utils/async-timeout';
-import { CircuitBreaker } from '@utils/circuit-breaker';
+import { CircuitBreaker, CircuitBreakerRegistry } from '@utils/circuit-breaker';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
@@ -488,6 +488,13 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.verbose(`[Logout] Instance ${this.instance.name} - Unsubscribing from circuit breaker`);
       this.circuitBreakerUnsubscribe();
       this.circuitBreakerUnsubscribe = null;
+    }
+
+    // ✅ FIX MEMORY LEAK: Rimuovi circuit breaker dal registry globale
+    // Senza questo, il CircuitBreakerRegistry accumula istanze mai pulite
+    if (this.instance?.name) {
+      this.logger.verbose(`[Logout] Instance ${this.instance.name} - Removing circuit breaker from registry`);
+      CircuitBreakerRegistry.getInstance().removeBreaker(this.instance.name);
     }
 
     // ✅ FIX 1.1: Usa ResourceRegistry per cleanup completo di tutte le risorse
