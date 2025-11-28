@@ -50,7 +50,12 @@ export class WAMonitoringService {
           if (this.waInstances[instance]?.connectionStatus?.state !== 'open') {
             if (this.waInstances[instance]?.connectionStatus?.state === 'connecting') {
               if ((await this.waInstances[instance].integration) === Integration.WHATSAPP_BAILEYS) {
-                await this.waInstances[instance]?.client?.logout('Log out instance: ' + instance);
+                // FIX: Wrap logout in try-catch to handle "Connection Closed" error
+                try {
+                  await this.waInstances[instance]?.client?.logout('Log out instance: ' + instance);
+                } catch {
+                  // Ignore - connection may already be closed
+                }
                 this.waInstances[instance]?.client?.ws?.close();
                 this.waInstances[instance]?.client?.end(undefined);
               }

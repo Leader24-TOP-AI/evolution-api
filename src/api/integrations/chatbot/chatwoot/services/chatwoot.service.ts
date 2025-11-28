@@ -1386,7 +1386,12 @@ export class ChatwootService {
 
           await this.createBotMessage(instance, msgLogout, 'incoming');
 
-          await waInstance?.client?.logout('Log out instance: ' + instance.instanceName);
+          // FIX: Wrap logout in try-catch to handle "Connection Closed" error
+          try {
+            await waInstance?.client?.logout('Log out instance: ' + instance.instanceName);
+          } catch {
+            // Ignore - connection may already be closed
+          }
           await waInstance?.client?.ws?.close();
         }
       }
