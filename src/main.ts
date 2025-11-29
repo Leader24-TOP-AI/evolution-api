@@ -5,7 +5,7 @@ import '@utils/instrumentSentry';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { HttpStatus, router } from '@api/routes/index.router';
-import { eventManager, proxyMonitorService, waMonitor } from '@api/server.module';
+import { eventManager, healthMonitorService, proxyMonitorService, waMonitor } from '@api/server.module';
 import {
   Auth,
   configService,
@@ -29,6 +29,7 @@ import { join } from 'path';
 function initWA() {
   waMonitor.loadInstance();
   proxyMonitorService.startMonitoring();
+  healthMonitorService.startCleanupScheduler();
 }
 
 async function bootstrap() {

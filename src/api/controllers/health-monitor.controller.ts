@@ -126,4 +126,24 @@ export class HealthMonitorController {
       deletedCount,
     };
   }
+
+  /**
+   * Get database statistics
+   * GET /health-monitor/database/stats
+   */
+  public async getDatabaseStats() {
+    return this.healthMonitorService.getDatabaseStats();
+  }
+
+  /**
+   * Run full database cleanup
+   * POST /health-monitor/database/cleanup
+   */
+  public async runDatabaseCleanup(retentionDays?: number) {
+    const stats = await this.healthMonitorService.runFullCleanup(retentionDays);
+    return {
+      success: true,
+      ...stats,
+    };
+  }
 }

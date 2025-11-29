@@ -17,8 +17,25 @@ import { PrismaRepository } from '@api/repository/repository.service';
 import { Logger } from '@config/logger.config';
 import { withDbTimeout } from '@utils/async-timeout';
 import { CircuitBreakerRegistry } from '@utils/circuit-breaker';
+import * as cron from 'node-cron';
 
 import { WAMonitoringService } from './monitor.service';
+
+// Database cleanup statistics
+export interface DatabaseCleanupStats {
+  messages: number;
+  messageUpdates: number;
+  healthEvents: number;
+  isOnWhatsapp: number;
+  total: number;
+  executedAt: Date;
+}
+
+// Database table statistics
+export interface DatabaseTableStats {
+  tableName: string;
+  rowCount: number;
+}
 
 export class HealthMonitorService {
   constructor(
@@ -28,6 +45,12 @@ export class HealthMonitorService {
 
   private readonly logger = new Logger('HealthMonitorService');
   private readonly startTime = Date.now();
+
+  // Database cleanup configuration
+  private cleanupTask: cron.ScheduledTask | null = null;
+  private readonly CLEANUP_CRON = '0 4 * * *'; // Daily at 4 AM
+  private readonly RETENTION_DAYS = 7; // 7 days retention for all tables
+  private lastCleanupStats: DatabaseCleanupStats | null = null;
 
   /**
    * Get complete dashboard data
@@ -640,6 +663,193 @@ export class HealthMonitorService {
     } catch (error) {
       this.logger.error(`Error checking watchdog status: ${error}`);
       return 'unknown';
+    }
+  }
+
+  // ==========================================
+  // DATABASE CLEANUP METHODS
+  // ==========================================
+
+  /**
+   * Start the automatic database cleanup scheduler
+   */
+  public startCleanupScheduler(): void {
+    if (this.cleanupTask) {
+      this.logger.warn('Cleanup scheduler already running');
+      return;
+    }
+
+    this.logger.info(`Starting Database Cleanup Scheduler (cron: ${this.CLEANUP_CRON})`);
+
+    this.cleanupTask = cron.schedule(this.CLEANUP_CRON, async () => {
+      try {
+        this.logger.info('Running scheduled database cleanup...');
+        await this.runFullCleanup();
+      } catch (error) {
+        this.logger.error(`Error in scheduled cleanup: ${error}`);
+      }
+    });
+
+    this.logger.info('Database Cleanup Scheduler started - runs daily at 4 AM');
+  }
+
+  /**
+   * Stop the cleanup scheduler
+   */
+  public stopCleanupScheduler(): void {
+    if (this.cleanupTask) {
+      this.cleanupTask.stop();
+      this.cleanupTask = null;
+      this.logger.info('Database Cleanup Scheduler stopped');
+    }
+  }
+
+  /**
+   * Run full database cleanup (all tables)
+   */
+  public async runFullCleanup(retentionDays?: number): Promise<DatabaseCleanupStats> {
+    const days = retentionDays || this.RETENTION_DAYS;
+    this.logger.info(`Running full database cleanup (retention: ${days} days)...`);
+
+    const stats: DatabaseCleanupStats = {
+      messages: 0,
+      messageUpdates: 0,
+      healthEvents: 0,
+      isOnWhatsapp: 0,
+      total: 0,
+      executedAt: new Date(),
+    };
+
+    try {
+      // Run all cleanups in parallel
+      const [messages, messageUpdates, healthEvents, isOnWhatsapp] = await Promise.all([
+        this.cleanupMessages(days),
+        this.cleanupMessageUpdates(),
+        this.cleanupOldEvents(days),
+        this.cleanupIsOnWhatsapp(days),
+      ]);
+
+      stats.messages = messages;
+      stats.messageUpdates = messageUpdates;
+      stats.healthEvents = healthEvents;
+      stats.isOnWhatsapp = isOnWhatsapp;
+      stats.total = messages + messageUpdates + healthEvents + isOnWhatsapp;
+
+      this.lastCleanupStats = stats;
+
+      this.logger.info(
+        `Database cleanup completed: ${stats.total} total records deleted ` +
+          `(Messages: ${stats.messages}, MessageUpdates: ${stats.messageUpdates}, ` +
+          `HealthEvents: ${stats.healthEvents}, IsOnWhatsapp: ${stats.isOnWhatsapp})`,
+      );
+
+      return stats;
+    } catch (error) {
+      this.logger.error(`Error during full cleanup: ${error}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Clean up old messages
+   */
+  public async cleanupMessages(retentionDays: number = 7): Promise<number> {
+    try {
+      const cutoffDate = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+
+      const result = await withDbTimeout(
+        this.prismaRepository.message.deleteMany({
+          where: {
+            messageTimestamp: { lt: Math.floor(cutoffDate.getTime() / 1000) },
+          },
+        }),
+        'healthMonitor:cleanupMessages:deleteMany',
+      );
+
+      this.logger.info(`Cleaned up ${result.count} old messages`);
+      return result.count;
+    } catch (error) {
+      this.logger.error(`Error cleaning up messages: ${error}`);
+      return 0;
+    }
+  }
+
+  /**
+   * Clean up old message updates
+   * Note: MessageUpdate records are automatically deleted via CASCADE when their parent Message is deleted.
+   * This method exists for explicit cleanup if needed, but normally returns 0 since CASCADE handles it.
+   */
+  public async cleanupMessageUpdates(): Promise<number> {
+    // MessageUpdate doesn't have a timestamp field - it's deleted via CASCADE when Message is deleted
+    // Return 0 as CASCADE handles the cleanup automatically
+    this.logger.info('MessageUpdate cleanup handled via CASCADE on Message deletion');
+    return 0;
+  }
+
+  /**
+   * Clean up old IsOnWhatsapp cache entries
+   */
+  public async cleanupIsOnWhatsapp(retentionDays: number = 7): Promise<number> {
+    try {
+      const cutoffDate = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+
+      const result = await withDbTimeout(
+        this.prismaRepository.isOnWhatsapp.deleteMany({
+          where: {
+            createdAt: { lt: cutoffDate },
+          },
+        }),
+        'healthMonitor:cleanupIsOnWhatsapp:deleteMany',
+      );
+
+      this.logger.info(`Cleaned up ${result.count} old IsOnWhatsapp cache entries`);
+      return result.count;
+    } catch (error) {
+      this.logger.error(`Error cleaning up IsOnWhatsapp: ${error}`);
+      return 0;
+    }
+  }
+
+  /**
+   * Get database table statistics
+   */
+  public async getDatabaseStats(): Promise<{
+    tables: DatabaseTableStats[];
+    lastCleanup: DatabaseCleanupStats | null;
+    retentionDays: number;
+    cleanupSchedule: string;
+  }> {
+    try {
+      // Get row counts for main tables
+      const [messages, messageUpdates, healthEvents, isOnWhatsapp, instances, chats, contacts] = await Promise.all([
+        this.prismaRepository.message.count(),
+        this.prismaRepository.messageUpdate.count(),
+        this.prismaRepository.healthEvent.count(),
+        this.prismaRepository.isOnWhatsapp.count(),
+        this.prismaRepository.instance.count(),
+        this.prismaRepository.chat.count(),
+        this.prismaRepository.contact.count(),
+      ]);
+
+      const tables: DatabaseTableStats[] = [
+        { tableName: 'Message', rowCount: messages },
+        { tableName: 'MessageUpdate', rowCount: messageUpdates },
+        { tableName: 'HealthEvent', rowCount: healthEvents },
+        { tableName: 'IsOnWhatsapp', rowCount: isOnWhatsapp },
+        { tableName: 'Instance', rowCount: instances },
+        { tableName: 'Chat', rowCount: chats },
+        { tableName: 'Contact', rowCount: contacts },
+      ];
+
+      return {
+        tables,
+        lastCleanup: this.lastCleanupStats,
+        retentionDays: this.RETENTION_DAYS,
+        cleanupSchedule: this.CLEANUP_CRON,
+      };
+    } catch (error) {
+      this.logger.error(`Error getting database stats: ${error}`);
+      throw error;
     }
   }
 }

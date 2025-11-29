@@ -89,9 +89,22 @@ export class HealthMonitorRouter extends RouterBroker {
         res.status(HttpStatus.OK).json(response);
       })
 
-      // POST /health-monitor/cleanup - Cleanup old events
+      // POST /health-monitor/cleanup - Cleanup old events (legacy endpoint)
       .post('/cleanup', authGuard['apikey'], async (req, res) => {
         const response = await healthMonitorController.cleanupOldEvents();
+        res.status(HttpStatus.OK).json(response);
+      })
+
+      // GET /health-monitor/database/stats - Database statistics
+      .get('/database/stats', authGuard['apikey'], async (req, res) => {
+        const response = await healthMonitorController.getDatabaseStats();
+        res.status(HttpStatus.OK).json(response);
+      })
+
+      // POST /health-monitor/database/cleanup - Full database cleanup
+      .post('/database/cleanup', authGuard['apikey'], async (req, res) => {
+        const retentionDays = req.query.retentionDays ? parseInt(req.query.retentionDays as string) : undefined;
+        const response = await healthMonitorController.runDatabaseCleanup(retentionDays);
         res.status(HttpStatus.OK).json(response);
       });
   }
