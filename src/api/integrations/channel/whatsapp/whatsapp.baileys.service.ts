@@ -84,6 +84,7 @@ import { Instance, Message } from '@prisma/client';
 import { TimeoutError, withDbTimeout, withHttpTimeout, withRedisTimeout } from '@utils/async-timeout';
 import { CircuitBreaker, CircuitBreakerRegistry } from '@utils/circuit-breaker';
 import { createJid } from '@utils/createJid';
+import { getDisconnectReasonInfo } from '@utils/disconnect-reason-map';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
@@ -719,6 +720,35 @@ export class BaileysStartupService extends ChannelStartupService {
       // Codici che NON devono MAI riconnettersi (logout reale, session sostituita, etc.)
       const codesToNeverReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406, 440];
       let shouldReconnect = !codesToNeverReconnect.includes(statusCode);
+
+      // ✅ DIAGNOSTICA: Salva evento disconnessione nel database per analisi
+      const reasonInfo = getDisconnectReasonInfo(statusCode);
+      const errorMessage = (lastDisconnect?.error as Error)?.message || null;
+      try {
+        await this.prismaRepository.healthEvent.create({
+          data: {
+            instanceId: this.instanceId,
+            eventType: 'connection_closed',
+            severity: codesToNeverReconnect.includes(statusCode) ? 'critical' : 'warn',
+            message: `Disconnected: ${reasonInfo.name} (${statusCode || 'N/A'})`,
+            details: {
+              statusCode: statusCode || null,
+              reason: reasonInfo.name,
+              description: reasonInfo.description,
+              errorMessage,
+              willReconnect: shouldReconnect,
+              wasOpenBefore: wasOpenBeforeClose,
+              recoverable: reasonInfo.recoverable,
+              timestamp: new Date().toISOString(),
+            },
+          },
+        });
+        this.logger.info(
+          `[Connection] Instance ${this.instance.name} - 📝 Logged disconnection event: ${reasonInfo.name} (${statusCode})`,
+        );
+      } catch (err) {
+        this.logger.warn(`[Connection] Instance ${this.instance.name} - Failed to log disconnection event: ${err}`);
+      }
 
       // 408 = Request Timeout - recuperabile SOLO se l'istanza era già connessa
       // Per nuove istanze (QR scan), 408 indica problema iniziale → no retry (evita loop infinito)
