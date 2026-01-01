@@ -213,21 +213,40 @@ export class WatchdogService {
           continue;
         }
 
-        // ✅ FIX INTERAZIONE 3: Skip if internal restart is in progress
-        // The instance signals this by setting circuitState to 'RESTARTING'
-        if (heartbeat.circuitState === 'RESTARTING') {
-          this.log(
-            'INFO',
-            `Instance ${instance.name} - Internal restart in progress (circuitState=RESTARTING), skipping watchdog recovery`,
-          );
-          continue;
-        }
-
-        // SCENARIO 2: Heartbeat too old (process frozen or dead)
+        // SCENARIO 2 (PRIORITÀ ALTA): Heartbeat too old (process frozen or dead)
+        // ✅ FIX BUG DEADLOCK: Questo controllo DEVE venire PRIMA del check per RESTARTING
+        // Altrimenti se circuitState='RESTARTING' ma il processo è morto, non viene mai rilevato
         if (heartbeat.lastHeartbeat < heartbeatCutoff) {
           const stuckDuration = now.getTime() - heartbeat.lastHeartbeat.getTime();
           this.log('ERROR', `Instance ${instance.name} - No heartbeat for ${Math.round(stuckDuration / 1000)}s`);
+
+          // Se era in RESTARTING ma il heartbeat è morto, resetta lo stato prima del recovery
+          if (heartbeat.circuitState === 'RESTARTING') {
+            this.log(
+              'WARN',
+              `Instance ${instance.name} - RESTARTING state stale (heartbeat dead for ${Math.round(stuckDuration / 1000)}s), forcing recovery`,
+            );
+            await withWatchdogTimeout(
+              this.prisma.watchdogHeartbeat.update({
+                where: { instanceId: instance.id },
+                data: { circuitState: 'CLOSED' },
+              }),
+              'resetRestartingState',
+            );
+          }
+
           await this.handleStuckInstance(instance.id, instance.name, 'stale_heartbeat', heartbeat.recoveryAttempts);
+          continue;
+        }
+
+        // ✅ FIX INTERAZIONE 3: Skip if internal restart is in progress AND heartbeat is still active
+        // The instance signals this by setting circuitState to 'RESTARTING'
+        // NOTA: Questo check viene DOPO il heartbeat timeout, così se il processo è morto viene comunque rilevato
+        if (heartbeat.circuitState === 'RESTARTING') {
+          this.log(
+            'INFO',
+            `Instance ${instance.name} - Internal restart in progress (circuitState=RESTARTING, heartbeat active), skipping watchdog recovery`,
+          );
           continue;
         }
 
