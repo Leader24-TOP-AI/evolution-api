@@ -809,6 +809,7 @@ model WatchdogHeartbeat {
   state            String    @db.VarChar(20)
   stuckSince       DateTime? @db.Timestamp
   recoveryAttempts Int       @default(0) @db.Integer
+  pm2RestartCount  Int       @default(0) @db.Integer
   circuitState     String?   @db.VarChar(20)
   lastRecovery     DateTime? @db.Timestamp
   createdAt        DateTime  @default(now()) @db.Timestamp

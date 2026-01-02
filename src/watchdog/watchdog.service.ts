@@ -24,6 +24,9 @@ import { exec } from 'child_process';
 // ✅ FIX 1.4: Timeout wrapper per query DB del watchdog
 const DB_TIMEOUT_MS = 10000; // 10 secondi - più alto per il watchdog che deve essere robusto
 
+// ✅ FIX RESTART LOOP: Limite massimo PM2 restart per istanza prima di marcarla irrecuperabile
+const MAX_PM2_RESTARTS_PER_INSTANCE = 5;
+
 async function withWatchdogTimeout<T>(promise: Promise<T>, operationName: string): Promise<T> {
   let timeoutId: NodeJS.Timeout;
 
@@ -213,6 +216,15 @@ export class WatchdogService {
           continue;
         }
 
+        // ✅ FIX RESTART LOOP: Skip irrecoverable instances (exceeded max PM2 restarts)
+        if (heartbeat.pm2RestartCount >= MAX_PM2_RESTARTS_PER_INSTANCE) {
+          this.log(
+            'DEBUG',
+            `Instance ${instance.name} - IRRECOVERABLE (${heartbeat.pm2RestartCount} PM2 restarts), skipping`,
+          );
+          continue;
+        }
+
         // SCENARIO 2 (PRIORITÀ ALTA): Heartbeat too old (process frozen or dead)
         // ✅ FIX BUG DEADLOCK: Questo controllo DEVE venire PRIMA del check per RESTARTING
         // Altrimenti se circuitState='RESTARTING' ma il processo è morto, non viene mai rilevato
@@ -272,16 +284,17 @@ export class WatchdogService {
           }
         } else {
           // Clear stuckSince if not in connecting state
-          if (heartbeat.stuckSince) {
+          if (heartbeat.stuckSince || heartbeat.recoveryAttempts > 0 || heartbeat.pm2RestartCount > 0) {
             // ✅ FIX 1.4: Clear stuck timer (con timeout)
+            // ✅ FIX RESTART LOOP: Reset anche pm2RestartCount quando istanza recupera
             await withWatchdogTimeout(
               this.prisma.watchdogHeartbeat.update({
                 where: { instanceId: instance.id },
-                data: { stuckSince: null, recoveryAttempts: 0 },
+                data: { stuckSince: null, recoveryAttempts: 0, pm2RestartCount: 0 },
               }),
               'clearStuckTimer',
             );
-            this.log('INFO', `Instance ${instance.name} recovered, clearing stuck timer`);
+            this.log('INFO', `Instance ${instance.name} recovered, clearing stuck timer and reset counters`);
           }
         }
 
@@ -331,16 +344,34 @@ export class WatchdogService {
 
     // ✅ OTTIMIZZAZIONE: Escalation semplificata
     // - Attempts 1-2: API restart (gentile)
-    // - Attempt 3+: PM2 restart diretto (Force DB Flag rimosso perché inefficace se processo frozen)
+    // - Attempt 3+: PM2 restart (max 5 per istanza, poi irrecuperabile)
     if (attempts <= this.config.maxRecoveryAttempts) {
       // API-based restart
       this.log('INFO', `Instance ${instanceName} - Attempting API restart (attempt ${attempts})`);
       await this.restartViaApi(instanceName);
     } else {
+      // ✅ FIX RESTART LOOP: Check if instance has exceeded max PM2 restarts
+      if (updated.pm2RestartCount >= MAX_PM2_RESTARTS_PER_INSTANCE) {
+        this.log(
+          'ERROR',
+          `Instance ${instanceName} - IRRECOVERABLE after ${updated.pm2RestartCount} PM2 restarts, stopping recovery`,
+        );
+        return; // Stop trying, instance is dead
+      }
+
+      // Increment PM2 restart count for this instance
+      const pm2Updated = await withWatchdogTimeout(
+        this.prisma.watchdogHeartbeat.update({
+          where: { instanceId },
+          data: { pm2RestartCount: { increment: 1 } },
+        }),
+        'incrementPm2RestartCount',
+      );
+
       // Nuclear option - restart entire PM2 process
       this.log(
         'ERROR',
-        `Instance ${instanceName} - Max attempts (${this.config.maxRecoveryAttempts}) exceeded, restarting PM2 process`,
+        `Instance ${instanceName} - PM2 restart attempt ${pm2Updated.pm2RestartCount}/${MAX_PM2_RESTARTS_PER_INSTANCE}`,
       );
       await this.restartPm2Process();
     }
