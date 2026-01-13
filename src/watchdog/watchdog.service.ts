@@ -216,13 +216,30 @@ export class WatchdogService {
           continue;
         }
 
-        // ✅ FIX RESTART LOOP: Skip irrecoverable instances (exceeded max PM2 restarts)
+        // ✅ FIX RESTART LOOP + AUTO-RECOVERY: Gestione istanze irrecoverable
         if (heartbeat.pm2RestartCount >= MAX_PM2_RESTARTS_PER_INSTANCE) {
-          this.log(
-            'DEBUG',
-            `Instance ${instance.name} - IRRECOVERABLE (${heartbeat.pm2RestartCount} PM2 restarts), skipping`,
-          );
-          continue;
+          // ✅ FIX BUG: Se l'istanza è tornata "open" con heartbeat recente, resettala
+          // Prima saltava sempre, lasciando l'istanza bloccata per sempre anche dopo riconnessione manuale
+          if (heartbeat.state === 'open' && heartbeat.lastHeartbeat >= heartbeatCutoff) {
+            this.log(
+              'INFO',
+              `Instance ${instance.name} - RECOVERED from irrecoverable state (now open with fresh heartbeat), resetting counters`,
+            );
+            await withWatchdogTimeout(
+              this.prisma.watchdogHeartbeat.update({
+                where: { instanceId: instance.id },
+                data: { stuckSince: null, recoveryAttempts: 0, pm2RestartCount: 0 },
+              }),
+              'resetIrrecoverableInstance',
+            );
+            // Continua con il check normale invece di skippare
+          } else {
+            this.log(
+              'DEBUG',
+              `Instance ${instance.name} - IRRECOVERABLE (${heartbeat.pm2RestartCount} PM2 restarts), skipping`,
+            );
+            continue;
+          }
         }
 
         // SCENARIO 2 (PRIORITÀ ALTA): Heartbeat too old (process frozen or dead)

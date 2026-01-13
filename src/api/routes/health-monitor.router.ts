@@ -89,6 +89,18 @@ export class HealthMonitorRouter extends RouterBroker {
         res.status(HttpStatus.OK).json(response);
       })
 
+      // POST /health-monitor/instance/reset/:instanceName - Reset watchdog counters (unblock irrecoverable)
+      .post(this.routerPath('instance/reset'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<InstanceDto>({
+          request: req,
+          schema: instanceSchema,
+          ClassRef: InstanceDto,
+          execute: (instance) => healthMonitorController.resetInstanceCounters(instance),
+        });
+
+        res.status(HttpStatus.OK).json(response);
+      })
+
       // POST /health-monitor/cleanup - Cleanup old events (legacy endpoint)
       .post('/cleanup', authGuard['apikey'], async (req, res) => {
         const response = await healthMonitorController.cleanupOldEvents();

@@ -349,6 +349,51 @@ export class HealthMonitorService {
   }
 
   /**
+   * Reset watchdog counters for an instance (pm2RestartCount, recoveryAttempts, stuckSince)
+   * Use this to manually unblock an instance marked as "irrecoverable"
+   */
+  public async resetInstanceCounters(instanceName: string): Promise<{ success: boolean; message: string }> {
+    try {
+      const instance = await this.prismaRepository.instance.findFirst({
+        where: { name: instanceName },
+      });
+
+      if (!instance) {
+        return { success: false, message: `Instance '${instanceName}' not found` };
+      }
+
+      const heartbeat = await this.prismaRepository.watchdogHeartbeat.findUnique({
+        where: { instanceId: instance.id },
+      });
+
+      if (!heartbeat) {
+        return { success: false, message: `No watchdog heartbeat found for instance '${instanceName}'` };
+      }
+
+      await this.prismaRepository.watchdogHeartbeat.update({
+        where: { instanceId: instance.id },
+        data: {
+          pm2RestartCount: 0,
+          recoveryAttempts: 0,
+          stuckSince: null,
+        },
+      });
+
+      this.logger.info(
+        `Watchdog counters reset for instance ${instanceName} (was: pm2RestartCount=${heartbeat.pm2RestartCount}, recoveryAttempts=${heartbeat.recoveryAttempts})`,
+      );
+
+      return {
+        success: true,
+        message: `Counters reset for instance '${instanceName}' (pm2RestartCount: ${heartbeat.pm2RestartCount} → 0, recoveryAttempts: ${heartbeat.recoveryAttempts} → 0)`,
+      };
+    } catch (error) {
+      this.logger.error(`Failed to reset counters for instance ${instanceName}: ${error}`);
+      return { success: false, message: `Error: ${error.message || error}` };
+    }
+  }
+
+  /**
    * Clean up old health events
    */
   public async cleanupOldEvents(retentionDays: number = 7): Promise<number> {

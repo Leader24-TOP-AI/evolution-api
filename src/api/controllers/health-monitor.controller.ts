@@ -116,6 +116,15 @@ export class HealthMonitorController {
   }
 
   /**
+   * Reset watchdog counters for an instance (pm2RestartCount, recoveryAttempts)
+   * Use this to manually unblock an instance marked as "irrecoverable"
+   * POST /health-monitor/instance/reset/:instanceName
+   */
+  public async resetInstanceCounters(instance: InstanceDto): Promise<{ success: boolean; message: string }> {
+    return this.healthMonitorService.resetInstanceCounters(instance.instanceName);
+  }
+
+  /**
    * Cleanup old health events
    * POST /health-monitor/cleanup
    */
