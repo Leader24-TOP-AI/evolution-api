@@ -1733,6 +1733,43 @@ export class BaileysStartupService extends ChannelStartupService {
         this.logger.verbose(`[HealthCheck] Instance ${this.instance.name} - Proxy connection test OK`);
       }
     }
+
+    // ✅ ZOMBIE DETECTION: Verifica che il WebSocket sia REALMENTE attivo
+    // GAP FIX: ws.readyState non era mai controllato nel codice
+    if (state === 'open' && this.client) {
+      try {
+        // Step 1: Verifica readyState del WebSocket (zero overhead, controllo locale)
+        // Cast necessario: il tipo WebSocketClient non espone readyState ma la proprietà esiste a runtime
+        const ws = this.client.ws as any;
+        if (ws) {
+          const readyState = ws.readyState as number | undefined;
+          // WebSocket states: 0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED
+          if (readyState !== undefined && readyState !== 1) {
+            this.logger.warn(
+              `[HealthCheck] Instance ${this.instance.name} - ZOMBIE DETECTED: state='open' but ws.readyState=${readyState} (expected 1)`,
+            );
+            await this.forceRestart('WebSocket not in OPEN state despite connection.open');
+            return;
+          }
+        }
+
+        // Step 2: Probe attivo - fetchStatus forza round-trip al server WhatsApp
+        // NON usa sendPresenceUpdate('available') perché blocca le notifiche push (da docs Baileys)
+        if (this.instance.wuid) {
+          await Promise.race([
+            this.client.fetchStatus(this.instance.wuid),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('fetchStatus timeout')), 5000)),
+          ]);
+        }
+
+        this.logger.verbose(`[HealthCheck] Instance ${this.instance.name} - WebSocket connection verified alive`);
+      } catch (error) {
+        this.logger.warn(`[HealthCheck] Instance ${this.instance.name} - ZOMBIE DETECTED: ${error.message}`);
+        this.circuitBreaker?.recordFailure('zombie_connection');
+        await this.forceRestart('Connection zombie - failed to communicate with WhatsApp server');
+        return;
+      }
+    }
   }
 
   /**
